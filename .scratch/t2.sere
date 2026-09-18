@@ -1,0 +1,39 @@
+class Box:
+    value: i64
+
+    def __init__(self) -> None:
+        self.value = 0
+
+    def set_value(self, v: i64) -> None:
+        self.value = v
+
+
+class Holder:
+    @private box: Box
+
+    def __init__(self, box: Box) -> None:
+        self.box = box
+
+    def bump(self) -> None:
+        self.box.set_value(0x44)
+
+
+def local_direct() -> None:
+    box = Box()
+    box.set_value(0x11)
+    print(box.value)  # expect 17
+
+
+def local_passed() -> None:
+    box = Box()
+    holder = Holder(box)
+    holder.bump()
+    print(box.value)  # expect 68 if references are shared
+
+
+def main() -> i32:
+    print("local_direct")
+    local_direct()
+    print("local_passed")
+    local_passed()
+    return 0

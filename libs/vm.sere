@@ -1,0 +1,58 @@
+import bytes
+
+# Address the emulated program is loaded at and where execution starts.
+const PROGRAM_START: i64 = 0x1000
+
+
+# A small 6502-style machine: registers plus flat, byte-addressable memory.
+#
+# Class instances are values in Sere, so passing a bare VM to a class or
+# function copies it and writes to that copy are lost. Anything that has to
+# mutate the same machine takes it as a Ptr[VM] (see `&vm` in main.sere).
+class VM:
+    A: i64
+    X: i64
+    Y: i64
+    pc: i64
+
+    @private memory: bytes.Buffer
+    @private _is_running: bool
+
+    def __init__(self, size: i64) -> None:
+        self.A = 0
+        self.X = 0
+        self.Y = 0
+        self.pc = PROGRAM_START
+        self.memory = bytes.Buffer(size)
+        self._is_running = False
+
+    def run(self) -> None:
+        self._is_running = True
+
+    def read(self, address: i64) -> byte:
+        return self.memory[address]
+
+    def write(self, address: i64, value: byte) -> void:
+        self.memory.set(address, value)
+
+    # Read the byte the program counter points at, then advance the counter.
+    def read_byte(self) -> byte:
+        value = self.memory[self.pc]
+        self.pc += 1
+        return value
+
+    def read_byte_at(self, address: i64) -> byte:
+        return self.memory[address]
+
+    def write_byte_at(self, address: i64, value: byte) -> void:
+        self.memory.set(address, value)
+
+    def load(self, data: list[byte], address: i64 = PROGRAM_START) -> void:
+        for i in range(0, i32(len(data))):
+            self.write(address + (i as i64), data[i])
+
+    def halt(self):
+        self._is_running = False
+
+    def is_running(self) -> bool:
+        return self._is_running

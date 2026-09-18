@@ -1,0 +1,38 @@
+import log
+
+import processor
+from vm import VM
+
+const MEMORY_SIZE: i64 = 65536
+
+static vm: VM = VM(MEMORY_SIZE)
+static logger: log.Logger = log.get_logger("main")
+
+
+# Fetch, decode, and run a single instruction.
+# The machine is passed as &vm so the handler mutates this VM instead of a copy.
+# Returns false when the opcode is not implemented.
+def step() -> bool:
+    opcode = vm.read_byte()
+    if not processor.execute(&vm, opcode):
+        logger.error(f"Unknown opcode: {opcode}")
+        return False
+
+    logger.info(f"Executed instruction: {processor.mnemonic(opcode)}")
+    return True
+
+
+def main() -> i32:
+    print(vm.A)
+
+    vm.load([0xA9, 0x04, 0x02])
+    vm.run()
+    for i in range(100):
+        if not vm.is_running():
+            break
+        if not step():
+            break
+    logger.info("Execution stopped.")
+
+    print(vm.A)
+    return 0

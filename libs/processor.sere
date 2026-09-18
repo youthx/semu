@@ -1,0 +1,105 @@
+from vm import VM
+
+# How an instruction locates its operand in memory.
+enum InstMode:
+    Immediate
+
+    def get_name(self) -> str:
+        match self:
+            case InstMode.Immediate:
+                return "immediate"
+
+
+# One decoded instruction: mnemonic, addressing mode, and the code that runs it.
+# Handlers take the machine as a Ptr[VM] so they mutate the caller's VM instead
+# of a copy of it.
+struct Instruction:
+    name: str
+    mode: InstMode
+    handler: Callable[[Ptr[VM], InstMode], None]
+
+    def __str__(self) -> str:
+        return f"{self.name} {self.mode.get_name()}"
+
+def _hlt(vm: Ptr[VM], mode: InstMode) -> None:
+    match mode:
+        case InstMode.Immediate:
+            (*vm).halt()
+
+def _lda(vm: Ptr[VM], mode: InstMode) -> None:
+    match mode:
+        case InstMode.Immediate:
+            (*vm).A = (*vm).read_byte()
+
+def _ldx(vm: Ptr[VM], mode: InstMode) -> None:
+    match mode:
+        case InstMode.Immediate:
+            (*vm).X = (*vm).read_byte()
+
+def _ldy(vm: Ptr[VM], mode: InstMode) -> None:
+    match mode:
+        case InstMode.Immediate:
+            (*vm).Y = (*vm).read_byte()
+
+def _sta(vm: Ptr[VM], mode: InstMode) -> None:
+    lsb = (*vm).read_byte_at((*vm).pc + 1)
+    msb = (*vm).read_byte_at((*vm).pc + 2)
+    loc = msb * 256 + lsb
+
+    (*vm).write_byte_at(loc, (*vm).A)
+    (*vm).pc += 3
+
+def _stx(vm: Ptr[VM], mode: InstMode) -> None:
+    lsb = (*vm).read_byte_at((*vm).pc + 1)
+    msb = (*vm).read_byte_at((*vm).pc + 2)
+    loc = msb * 256 + lsb
+
+    (*vm).write_byte_at(loc, (*vm).X)
+    (*vm).pc += 3
+
+def _sty(vm: Ptr[VM], mode: InstMode) -> None:
+    lsb = (*vm).read_byte_at((*vm).pc + 1)
+    msb = (*vm).read_byte_at((*vm).pc + 2)
+    loc = msb * 256 + lsb
+
+    (*vm).write_byte_at(loc, (*vm).Y)
+    (*vm).pc += 3
+
+def _sty(vm: Ptr[VM], mode: InstMode) -> None:
+    lsb = (*vm).read_byte_at((*vm).pc + 1)
+    msb = (*vm).read_byte_at((*vm).pc + 2)
+    loc = msb * 256 + lsb
+
+    (*vm).write_byte_at(loc, (*vm).Y)
+    (*vm).pc += 3
+
+
+
+# Opcode -> instruction.
+const INST_MAP = {
+    0x02: Instruction("HLT", InstMode.Immediate, _hlt),
+    0xA9: Instruction("LDA", InstMode.Immediate, _lda),
+    0xA2: Instruction("LDX", InstMode.Immediate, _ldx),
+    0xA0: Instruction("LDY", InstMode.Immediate, _ldy),
+    0x8D: Instruction("STA", InstMode.Immediate, _sta),
+}
+
+
+# Decode `opcode` and run it against `vm`.
+# Returns false when the opcode is not implemented.
+def execute(vm: Ptr[VM], opcode: byte) -> bool:
+    instruction = INST_MAP.get(opcode)
+    if instruction is None:
+        return False
+
+    instruction.handler(vm, instruction.mode)
+    return True
+
+
+# Human-readable text for an opcode, e.g. "LDA immediate".
+def mnemonic(opcode: byte) -> str:
+    instruction = INST_MAP.get(opcode)
+    if instruction is None:
+        return "unknown"
+
+    return str(instruction)

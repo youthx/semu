@@ -1,0 +1,52 @@
+class Box:
+    value: i64
+
+    def __init__(self) -> None:
+        self.value = 0
+
+    def set_value(self, v: i64) -> None:
+        self.value = v
+
+
+def mutate(b: Box) -> None:
+    b.set_value(0x22)
+
+
+class Widget:
+    b: Box
+
+    def __init__(self, b: Box) -> None:
+        self.b = b
+
+    def mutate_member(self) -> None:
+        self.b.set_value(0x33)
+
+
+def alias_local() -> None:
+    a = Box()
+    b = a
+    b.set_value(0x07)
+    print(a.value)  # expect 7 if aliases share
+
+
+def pass_to_function() -> None:
+    a = Box()
+    mutate(a)
+    print(a.value)  # expect 34 if params are references
+
+
+def pass_to_method() -> None:
+    a = Box()
+    w = Widget(a)
+    w.mutate_member()
+    print(a.value)  # expect 51 if member assignment keeps identity
+
+
+def main() -> i32:
+    print("alias_local")
+    alias_local()
+    print("pass_to_function")
+    pass_to_function()
+    print("pass_to_method")
+    pass_to_method()
+    return 0

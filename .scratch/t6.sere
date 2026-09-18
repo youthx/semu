@@ -1,0 +1,63 @@
+class VM:
+    A: i64
+    @private memory: i64
+
+    def __init__(self) -> None:
+        self.A = 0
+        self.memory = 0
+
+    def read_byte(self) -> byte:
+        self.memory += 1
+        return self.memory as byte
+
+    def set_memory(self, v: i64) -> None:
+        self.memory = v
+
+
+enum InstMode:
+    Immediate
+
+    def get_name(self) -> str:
+        match self:
+            case InstMode.Immediate:
+                return "immediate"
+
+
+struct Instruction:
+    name: str
+    mode: InstMode
+    handler: Callable[[Ptr[VM], InstMode], None]
+
+    def __str__(self) -> str:
+        return f"{self.name} {self.mode.get_name()}"
+
+
+def _lda(vm: Ptr[VM], mode: InstMode) -> None:
+    match mode:
+        case InstMode.Immediate:
+            (*vm).A = (*vm).read_byte()
+
+
+const INST_MAP = {
+    0xA9: Instruction("LDA", InstMode.Immediate, _lda),
+}
+
+
+def dispatch(vm: Ptr[VM], opcode: byte) -> bool:
+    inst = INST_MAP.get(opcode)
+    if inst is None:
+        return False
+    print(inst)
+    inst.handler(vm, inst.mode)
+    return True
+
+
+static vm: VM = VM()
+
+
+def main() -> i32:
+    vm.set_memory(0x44)
+    ok = dispatch(&vm, 0xA9)
+    print(ok)
+    print(vm.A)
+    return 0

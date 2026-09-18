@@ -4,6 +4,8 @@ bin/*
 !bin/sere-path.sh
 venv/lib/
 venv/bin/
+venv/stdlib/
+
 libs/native/build/
 libs/.sere-lib/
 dist/

@@ -2,7 +2,6 @@
 
 #pragma runtime_checks("", off)
 #pragma comment(linker, "/NODEFAULTLIB:MSVCRTD")
-#pragma comment(linker, "/WHOLEARCHIVE:sere_native.lib")
 
 #include "sere/api/sere_mod.h"
 

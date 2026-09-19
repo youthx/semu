@@ -17,6 +17,6 @@ stdlib = "venv/stdlib"
 output = "bin/semu.exe"
 opt = "O0"
 # Build loose C/C++ files in libs/native when enabled.
-native = false
+native = true
 
 # Custom tool settings belong in [tool.<name>] tables.

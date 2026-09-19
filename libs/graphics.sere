@@ -1,0 +1,42 @@
+# SDL3 bindings implemented in libs/native/native.cpp.
+#
+# The native module owns the window: it draws the CPU state panel, the emulated
+# screen and the Run/Pause/Step/Reset controls, then reports which action the
+# user asked for. Sere feeds it the CPU state once per frame and streams the
+# framebuffer eight pixels per call, because a native module cannot hand raw
+# pointers into Sere data across the boundary.
+
+# Creates the window, renderer and screen texture. Returns 1 on success.
+extern "C" "semu_gfx_init"
+def gfx_init(width: i64, height: i64, zoom: i64) -> i64
+
+extern "C" "semu_gfx_shutdown"
+def gfx_shutdown() -> void
+
+# Action the user asked for; see the ACTION_* constants below.
+extern "C" "semu_gfx_poll"
+def gfx_poll() -> i64
+
+# Uploads eight consecutive screen bytes; `packed` is little endian.
+extern "C" "semu_gfx_blit"
+def gfx_blit(index: i64, packed: i64) -> void
+
+# Redraws the window with the current CPU state.
+extern "C" "semu_gfx_frame"
+def gfx_frame(a: i64, x: i64, y: i64, sp: i64, pc: i64, p: i64, cycles: i64, speed: i64, state: i64) -> void
+
+# Values returned by gfx_poll().
+const ACTION_NONE: i64 = 0
+const ACTION_QUIT: i64 = 1
+const ACTION_TOGGLE_RUN: i64 = 2
+const ACTION_STEP: i64 = 3
+const ACTION_RESET: i64 = 4
+const ACTION_FASTER: i64 = 5
+const ACTION_SLOWER: i64 = 6
+
+# Values accepted by gfx_frame() in the `state` argument.
+const STATE_READY: i64 = 0
+const STATE_RUNNING: i64 = 1
+const STATE_PAUSED: i64 = 2
+const STATE_HALTED: i64 = 3
+const STATE_ERROR: i64 = 4

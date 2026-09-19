@@ -1,21 +1,19 @@
 cmake_minimum_required(VERSION 3.20)
-project(sere_native LANGUAGES C CXX)
 
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+project(sere_native LANGUAGES C CXX)
 
 add_library(sere_native STATIC native.cpp)
 
 # Your existing include
 target_include_directories(sere_native PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../venv/include"
+    "C:\\Users\\jackw\\OneDrive\\Desktop\\git-projects\\sere-projects\\semu\\venv\\include"
 )
 
-# MSYS2 SDL3 include
+# MSYS2 SDL3 include + lib
 target_include_directories(sere_native PUBLIC
     "C:/msys64/mingw64/include"
 )
 
-# MSYS2 SDL3 lib
 target_link_directories(sere_native PUBLIC
     "C:/msys64/mingw64/lib"
 )

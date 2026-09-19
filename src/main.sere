@@ -1,144 +1,203 @@
 import log
 
 import processor
+from graphics import gfx_blit, gfx_frame, gfx_init, gfx_poll, gfx_shutdown
+from graphics import ACTION_FASTER, ACTION_QUIT, ACTION_RESET, ACTION_SLOWER, ACTION_STEP, ACTION_TOGGLE_RUN
+from graphics import STATE_READY, STATE_ERROR, STATE_HALTED, STATE_PAUSED, STATE_RUNNING
 from vm import PROGRAM_START, VM
 
 const MEMORY_SIZE: i64 = 65536
 const HEX_DIGITS: str = "0123456789ABCDEF"
 
+# Video memory: 128x128 pixels, one RGB332 byte per pixel, at $4000-$7FFF.
+const SCREEN_W: i64 = 128
+const SCREEN_H: i64 = 128
+const SCREEN_ZOOM: i64 = 2
+const SCREEN_BASE: i64 = 0x4000
+const BLIT_CHUNKS: i64 = 2048
+
+# Cycles the CPU may spend per displayed frame.
+const MIN_SPEED: i64 = 250
+const MAX_SPEED: i64 = 250000
+const DEFAULT_SPEED: i64 = 12000
+
 static vm: VM = VM(MEMORY_SIZE)
-static logger: log.Logger = log.get_logger("main")
+static logger: log.Logger = log.get_logger("semu")
 
 
 def hex_byte(value: i64) -> str:
     return HEX_DIGITS[(value >> 4) & 0x0F] + HEX_DIGITS[value & 0x0F]
 
 
-# Fetch, decode, and run a single instruction. The machine goes in as &vm so
-# handlers mutate this VM instead of a copy of it.
-def step() -> bool:
-    opcode = vm.read_byte()
-    logger.error(f"op={hex_byte(opcode)} {processor.mnemonic(opcode)}")
-    if not processor.execute(&vm, opcode):
-        logger.error(f"Unknown opcode: {hex_byte(opcode)}")
-        return False
-
-    logger.debug(f"Executed instruction: {processor.mnemonic(opcode)}")
-    return True
+def hex_word(value: i64) -> str:
+    return hex_byte((value >> 8) & 0xFF) + hex_byte(value & 0xFF)
 
 
-# Run until HLT, or until an unknown opcode shows up.
-def execute_program() -> bool:
-    while vm.is_running():
-        if not step():
-            return False
-    return True
-
-
-# Hand-assembled demo.
+# Hand-assembled demo program. Zero page $10 is a frame counter; every pass it
+# paints a bright pixel on the top row of video memory and dims the pixel eight
+# columns behind it, so a bar sweeps across the screen.
 #
-#   $1000  LDX #$00
-#   $1002  LDA #$00
-#   $1004  loop: INX
-#   $1005        STX $0200        ; remember the counter
-#   $1008        TXA
-#   $1009        CLC
-#   $100A        ADC $0200        ; A += X
-#   $100D        CPX #$0A
-#   $100F        BNE loop
-#   $1011        STA $0201        ; $0201 = $37  (1 + 2 + ... + 10)
-#   $1014        LDA #$01         ; zero page pointer $10/$11 -> $0201
-#   $1016        STA $10
-#   $1018        LDA #$02
-#   $101A        STA $11
-#   $101C        LDY #$00
-#   $101E        LDA ($10),Y      ; (indirect),Y reads $0201 back
-#   $1020        STA $0202
-#   $1023        LDX #$00
-#   $1025        LDA $10,X        ; zero page,X
-#   $1027        STA $0203
-#   $102A        LDX #$02
-#   $102C        LDA $1040,X      ; absolute,X reaches the table below
-#   $102F        JSR $1050        ; subroutine shifts A left
-#   $1032        STA $0204
-#   $1035        HLT
-#   $1040  table: $11, $22, $33
-#   $1050  ASL A / RTS
-const PROGRAM = [
-    # $1000  LDX #$00
-    0xA2, 0x00,
-    # $1002  LDA #$00
+#   $1000  LDA #$00
+#   $1002  STA $10          ; counter = 0
+#   $1004  loop: LDA $10
+#   $1006        AND #$7F    ; column = counter & 127
+#   $1008        TAY
+#   $1009        LDA #$FF    ; bright pixel
+#   $100B        STA $4000,Y
+#   $100E        TYA
+#   $100F        SEC
+#   $1010        SBC #$08    ; trail pixel eight columns behind
+#   $1012        AND #$7F
+#   $1014        TAY
+#   $1015        LDA #$18    ; dim pixel
+#   $1017        STA $4000,Y
+#   $101A        INC $10
+#   $101C        JMP loop
+const ROM = [
+    # $1000  LDA #$00
     0xA9, 0x00,
-    # $1004  loop: INX
-    0xE8,
-    # $1005  STX $0200
-    0x8E, 0x00, 0x02,
-    # $1008  TXA
-    0x8A,
-    # $1009  CLC
-    0x18,
-    # $100A  ADC $0200
-    0x6D, 0x00, 0x02,
-    # $100D  CPX #$0A
-    0xE0, 0x0A,
-    # $100F  BNE loop
-    0xD0, 0xF3,
-    # $1011  STA $0201
-    0x8D, 0x01, 0x02,
-    # $1014  LDA #$01
-    0xA9, 0x01,
-    # $1016  STA $10
+    # $1002  STA $10
     0x85, 0x10,
-    # $1018  LDA #$02
-    0xA9, 0x02,
-    # $101A  STA $11
-    0x85, 0x11,
-    # $101C  LDY #$00
-    0xA0, 0x00,
-    # $101E  LDA ($10),Y
-    0xB1, 0x10,
-    # $1020  STA $0202
-    0x8D, 0x02, 0x02,
-    # $1023  LDX #$00
-    0xA2, 0x00,
-    # $1025  LDA $10,X
-    0xB5, 0x10,
-    # $1027  STA $0203
-    0x8D, 0x03, 0x02,
-    # $102A  LDX #$02
-    0xA2, 0x02,
-    # $102C  LDA $1040,X
-    0xBD, 0x40, 0x10,
-    # $102F  JSR $1050
-    0x20, 0x50, 0x10,
-    # $1032  STA $0204
-    0x8D, 0x04, 0x02,
-    # $1035  HLT
-    0x02,
-    # $1036  padding out to the data table
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    # $1040  table: $11, $22, $33
-    0x11, 0x22, 0x33,
-    # $1043  padding out to the subroutine
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    # $1050  subroutine: ASL A / RTS
-    0x0A, 0x60,
+    # $1004  LDA $10
+    0xA5, 0x10,
+    # $1006  AND #$7F
+    0x29, 0x7F,
+    # $1008  TAY
+    0xA8,
+    # $1009  LDA #$FF
+    0xA9, 0xFF,
+    # $100B  STA $4000,Y
+    0x99, 0x00, 0x40,
+    # $100E  TYA
+    0x98,
+    # $100F  SEC
+    0x38,
+    # $1010  SBC #$08
+    0xE9, 0x08,
+    # $1012  AND #$7F
+    0x29, 0x7F,
+    # $1014  TAY
+    0xA8,
+    # $1015  LDA #$18
+    0xA9, 0x18,
+    # $1017  STA $4000,Y
+    0x99, 0x00, 0x40,
+    # $101A  INC $10
+    0xE6, 0x10,
+    # $101C  JMP $1004
+    0x4C, 0x04, 0x10,
 ]
 
 
-def main() -> i32:
-    logger.error("trace: reset")
-    vm.reset(PROGRAM_START)
-    logger.error("trace: load")
-    vm.load(PROGRAM)
-    logger.error("trace: run")
-    vm.run()
-    logger.error("trace: loop")
+# Colour the screen before the program runs: a grid of RGB332 blocks.
+def paint_background() -> void:
+    y = 0
+    while y < SCREEN_H:
+        x = 0
+        while x < SCREEN_W:
+            color = (((x >> 4) & 0x07) << 5) | (((y >> 4) & 0x07) << 2) | 0x03
+            vm.write(SCREEN_BASE + y * SCREEN_W + x, color as byte)
+            x += 1
+        y += 1
 
-    if not execute_program():
+
+def load_demo() -> void:
+    vm.reset(PROGRAM_START)
+    vm.load(ROM)
+    paint_background()
+    vm.run()
+
+
+# Fetch, decode and run one instruction. The machine is passed as &vm so the
+# handlers mutate this VM rather than a copy of it.
+def step() -> bool:
+    opcode = vm.read_byte()
+    if not processor.execute(&vm, opcode):
+        logger.error(f"unknown opcode ${hex_byte(opcode)} at ${hex_word(vm.pc - 1)}")
+        return False
+    return True
+
+
+# Copy video memory into the window texture, eight pixels per call.
+def blit_screen() -> void:
+    chunk = 0
+    while chunk < BLIT_CHUNKS:
+        base = SCREEN_BASE + chunk * 8
+        packed = vm.read(base) as i64
+        packed = packed | ((vm.read(base + 1) as i64) << 8)
+        packed = packed | ((vm.read(base + 2) as i64) << 16)
+        packed = packed | ((vm.read(base + 3) as i64) << 24)
+        packed = packed | ((vm.read(base + 4) as i64) << 32)
+        packed = packed | ((vm.read(base + 5) as i64) << 40)
+        packed = packed | ((vm.read(base + 6) as i64) << 48)
+        packed = packed | ((vm.read(base + 7) as i64) << 56)
+        gfx_blit(chunk, packed)
+        chunk += 1
+
+
+def main() -> i32:
+    if gfx_init(SCREEN_W, SCREEN_H, SCREEN_ZOOM) == 0:
+        logger.error("could not open an SDL3 window (is SDL3.dll available?)")
         return 1
 
-    logger.error("trace: done")
-    print(f"state   A=${hex_byte(vm.A)} X=${hex_byte(vm.X)} Y=${hex_byte(vm.Y)} SP=${hex_byte(vm.SP)} P=${hex_byte(vm.P)} CYC={vm.cycles}")
-    print(f"memory  $0200=${hex_byte(vm.read(0x0200))} $0201=${hex_byte(vm.read(0x0201))} $0202=${hex_byte(vm.read(0x0202))} $0203=${hex_byte(vm.read(0x0203))} $0204=${hex_byte(vm.read(0x0204))}")
+    load_demo()
+
+    paused = False
+    failed = False
+    speed = DEFAULT_SPEED
+
+    while True:
+        action = gfx_poll()
+
+        if action == ACTION_QUIT:
+            break
+        elif action == ACTION_TOGGLE_RUN:
+            if paused:
+                paused = False
+                if not vm.is_running():
+                    load_demo()
+            else:
+                paused = True
+        elif action == ACTION_STEP:
+            paused = True
+            if not vm.is_running():
+                load_demo()
+            step()
+            blit_screen()
+        elif action == ACTION_RESET:
+            load_demo()
+            failed = False
+            paused = False
+        elif action == ACTION_FASTER:
+            if speed < MAX_SPEED:
+                speed = speed << 1
+        elif action == ACTION_SLOWER:
+            if speed > MIN_SPEED:
+                speed = speed >> 1
+
+        if not paused:
+            used = 0
+            while used < speed and vm.is_running():
+                before = vm.cycles
+                if not step():
+                    failed = True
+                    paused = True
+                    break
+                used += vm.cycles - before
+            if not failed:
+                blit_screen()
+
+        state = STATE_READY
+        if failed:
+            state = STATE_ERROR
+        elif not vm.is_running():
+            state = STATE_HALTED
+        elif paused:
+            state = STATE_PAUSED
+        else:
+            state = STATE_RUNNING
+
+        gfx_frame(vm.A, vm.X, vm.Y, vm.SP, vm.pc, vm.P, vm.cycles, speed, state)
+
+    gfx_shutdown()
     return 0

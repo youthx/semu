@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(sere_native LANGUAGES C CXX)
 
-add_library(sere_native STATIC native.cpp)
+add_library(sere_native STATIC native.cpp semu.rc)
 
 # Your existing include
 target_include_directories(sere_native PUBLIC

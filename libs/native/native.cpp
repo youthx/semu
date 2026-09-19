@@ -2,6 +2,7 @@
 
 #pragma runtime_checks("", off)
 #pragma comment(linker, "/NODEFAULTLIB:MSVCRTD")
+#pragma comment(linker, "/WHOLEARCHIVE:sere_native.lib")
 
 #include "sere/api/sere_mod.h"
 
@@ -65,6 +66,9 @@ static SemuGetTicksFn sdl_GetTicks;
 static decltype(&SDL_CreateTexture) sdl_CreateTexture;
 static decltype(&SDL_UpdateTexture) sdl_UpdateTexture;
 static decltype(&SDL_DestroyTexture) sdl_DestroyTexture;
+static decltype(&SDL_LoadBMP) sdl_LoadBMP;
+static decltype(&SDL_DestroySurface) sdl_DestroySurface;
+static decltype(&SDL_SetWindowIcon) sdl_SetWindowIcon;
 static decltype(&SDL_PollEvent) sdl_PollEvent;
 static decltype(&SDL_ConvertEventToRenderCoordinates) sdl_ConvertEventToRenderCoordinates;
 static decltype(&SDL_GetKeyboardState) sdl_GetKeyboardState;
@@ -110,6 +114,9 @@ static bool load_sdl3(void) {
   SEMU_LOAD(CreateTexture)
   SEMU_LOAD(UpdateTexture)
   SEMU_LOAD(DestroyTexture)
+  SEMU_LOAD(LoadBMP)
+  SEMU_LOAD(DestroySurface)
+  SEMU_LOAD(SetWindowIcon)
   SEMU_LOAD(PollEvent)
   SEMU_LOAD(GetKeyboardState)
   SEMU_LOAD(ConvertEventToRenderCoordinates)
@@ -740,6 +747,14 @@ extern "C" int64_t semu_gfx_init(int64_t width, int64_t height, int64_t zoom) {
   renderer = sdl_CreateRenderer(window, nullptr);
   if (renderer == nullptr) {
     return 0;
+  }
+  SDL_Surface* icon = sdl_LoadBMP(storage_path("assets\\semu-logo.bmp"));
+  if (icon == nullptr) {
+    icon = sdl_LoadBMP(storage_path("..\\assets\\semu-logo.bmp"));
+  }
+  if (icon != nullptr) {
+    sdl_SetWindowIcon(window, icon);
+    sdl_DestroySurface(icon);
   }
   sdl_SetRenderScale(renderer, UI_SCALE, UI_SCALE);
   sdl_SetRenderVSync(renderer, 1);

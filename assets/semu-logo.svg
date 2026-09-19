@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">SEMU</title>
+  <desc id="desc">A pixel-inspired cyan and lime SEMU mark on a dark navy field.</desc>
+  <rect width="256" height="256" rx="32" fill="#0c1220"/>
+  <rect x="24" y="24" width="208" height="208" rx="20" fill="#111c2e" stroke="#263a55" stroke-width="4"/>
+  <path fill="#63d8e8" d="M72 68h112v28H96v20h64q24 0 24 24v16q0 32-32 32H72v-28h80v-16H88q-16 0-16-20V88q0-20 20-20Z"/>
+  <path fill="#b8e86b" d="M104 68h28v64q0 12 12 12t12-12V68h28v64q0 40-40 40t-40-40Z"/>
+  <rect x="48" y="204" width="48" height="8" rx="4" fill="#63d8e8"/>
+  <rect x="104" y="204" width="32" height="8" rx="4" fill="#b8e86b"/>
+</svg>

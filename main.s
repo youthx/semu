@@ -25,8 +25,8 @@
 ;  head), so a step costs a few hundred cycles instead of clearing 16K.
 ;
 ;  The host runs `speed` cycles per displayed frame (12000 by default) with
-;  vsync on. `wait` burns about 71000 cycles, which paces the snake at roughly
-;  ten steps a second. Raise DELAY_OUT for a slower game.
+;  vsync on. `wait` burns about 15000 cycles for responsive movement.
+;  Raise DELAY_OUT or DELAY_IN for a slower game.
 ; =========================================================================
 
 ; --- hardware -----------------------------------------------------------
@@ -83,23 +83,14 @@ BODY_X      = $0200
 BODY_Y      = $0300
 
 ; --- pacing -------------------------------------------------------------
-DELAY_OUT   = $47                      ; 71  * 1005 cycles
-DELAY_IN    = $C8                      ; 200 *    5 cycles
+DELAY_OUT   = $18                      ; 24 outer iterations
+DELAY_IN    = $80                      ; 128 inner iterations, about 15K cycles
 
 
 ; =========================================================================
 ;  entry point -- execution starts at the first byte of the image ($1000)
 ; =========================================================================
 start:
-        LDA #$42
-        STA $A000
-        LDA #$00
-        STA $5E02
-        STA $5E03
-        STA $5E04
-        LDA #$01
-        STA $5E00
-
         JSR clear_screen
         JSR init_game
         JSR wait                       ; a beat of grace before the first move

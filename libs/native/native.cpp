@@ -137,6 +137,10 @@ static int32_t screen_bytes = 0;
 static float screen_zoom = 2.0f;
 static bool screen_dirty = false;
 
+// While the screen is focused the keyboard belongs to the emulated CPU and the
+// debugger shortcuts stay out of the way.
+static bool screen_focus = false;
+
 // --- layout (logical units, the renderer is scaled by UI_SCALE) ------------
 
 static const float UI_SCALE = 2.0f;
@@ -144,8 +148,8 @@ static const float MARGIN = 6.0f;
 static const float PANEL_W = 168.0f;
 static const float LINE_H = 10.0f;
 static const float BUTTON_H = 20.0f;
-static const float BUTTON_Y = 172.0f;
-static const float HINT_Y = 202.0f;
+static const float BUTTON_Y = 180.0f;
+static const float HINT_Y = 206.0f;
 
 static const uint32_t COLOR_BG = 0x0E1116;
 static const uint32_t COLOR_PANEL = 0x171B23;
@@ -362,16 +366,40 @@ static void draw_panel(int64_t a, int64_t x, int64_t y, int64_t sp, int64_t pc, 
   draw_text("STATE", panel_x() + 6.0f, row, COLOR_DIM);
   draw_text(status, panel_x() + PANEL_W - 6.0f - (float)(text_len(status) * 8), row,
             state_color(state));
+  row += LINE_H;
 
+  const char* input = screen_focus ? "CPU" : "UI";
+  draw_text("INPUT", panel_x() + 6.0f, row, COLOR_DIM);
+  draw_text(input, panel_x() + PANEL_W - 6.0f - (float)(text_len(input) * 8), row,
+            screen_focus ? COLOR_ACCENT : COLOR_DIM);
+
+  // Focused: the controls are greyed out and only ESC or a click on the screen
+  // gives the keyboard back to the debugger.
   const bool paused = (state == STATE_PAUSED) || (state == STATE_HALTED) || (state == STATE_ERROR);
-  draw_button(buttons[0], paused ? "RUN" : "PAUSE", !paused);
+  draw_button(buttons[0], paused ? "RUN" : "PAUSE", !paused && !screen_focus);
   draw_button(buttons[1], "STEP", false);
   draw_button(buttons[2], "RESET", false);
 
-  draw_text("SPACE RUN/PAUSE", panel_x() + 6.0f, HINT_Y, COLOR_DIM);
-  draw_text("S STEP   R RESET", panel_x() + 6.0f, HINT_Y + 10.0f, COLOR_DIM);
-  draw_text("UP/DOWN SPEED", panel_x() + 6.0f, HINT_Y + 20.0f, COLOR_DIM);
-  draw_text("ESC QUIT", panel_x() + 6.0f, HINT_Y + 30.0f, COLOR_DIM);
+  const uint32_t hint = screen_focus ? COLOR_BORDER : COLOR_DIM;
+  if (screen_focus) {
+    draw_text("KEYS GO TO CPU", panel_x() + 6.0f, HINT_Y, COLOR_ACCENT);
+    draw_text("ESC OR CLICK ON", panel_x() + 6.0f, HINT_Y + 10.0f, hint);
+    draw_text("THE SCREEN TO", panel_x() + 6.0f, HINT_Y + 20.0f, hint);
+    draw_text("RELEASE FOCUS", panel_x() + 6.0f, HINT_Y + 30.0f, hint);
+  } else {
+    draw_text("SPACE RUN/PAUSE", panel_x() + 6.0f, HINT_Y, hint);
+    draw_text("S STEP   R RESET", panel_x() + 6.0f, HINT_Y + 10.0f, hint);
+    draw_text("UP/DOWN SPEED", panel_x() + 6.0f, HINT_Y + 20.0f, hint);
+    draw_text("F FOCUS SCREEN", panel_x() + 6.0f, HINT_Y + 30.0f, hint);
+  }
+}
+
+static bool inside_screen(float x, float y) {
+  const float left = screen_x();
+  const float top = screen_y();
+  const float w = (float)screen_w * screen_zoom;
+  const float h = (float)screen_h * screen_zoom;
+  return x >= left && x < left + w && y >= top && y < top + h;
 }
 
 static void draw_screen(void) {
@@ -380,7 +408,13 @@ static void draw_screen(void) {
   const float w = (float)screen_w * screen_zoom;
   const float h = (float)screen_h * screen_zoom;
 
-  fill_rect(x - 2.0f, y - 2.0f, w + 4.0f, h + 4.0f, COLOR_BORDER);
+  if (screen_focus) {
+    // Bright frame: the keyboard is driving the CPU, not the debugger.
+    fill_rect(x - 4.0f, y - 4.0f, w + 8.0f, h + 8.0f, COLOR_ACCENT);
+    fill_rect(x - 2.0f, y - 2.0f, w + 4.0f, h + 4.0f, COLOR_BG);
+  } else {
+    fill_rect(x - 2.0f, y - 2.0f, w + 4.0f, h + 4.0f, COLOR_BORDER);
+  }
 
   SDL_FRect destination = {x, y, w, h};
   sdl_RenderTexture(renderer, screen_texture, nullptr, &destination);
@@ -483,9 +517,21 @@ extern "C" int64_t semu_gfx_poll(void) {
     if (event.type == SDL_EVENT_QUIT) {
       action = ACTION_QUIT;
     } else if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+      // While the screen holds focus every key belongs to the CPU: ESC (or F)
+      // gives the keyboard back to the debugger and nothing else is consumed.
+      if (screen_focus) {
+        if (event.key.scancode == SDL_SCANCODE_ESCAPE ||
+            event.key.scancode == SDL_SCANCODE_F) {
+          screen_focus = false;
+        }
+        continue;
+      }
       switch (event.key.scancode) {
         case SDL_SCANCODE_ESCAPE:
           action = ACTION_QUIT;
+          break;
+        case SDL_SCANCODE_F:
+          screen_focus = true;
           break;
         case SDL_SCANCODE_SPACE:
           action = ACTION_TOGGLE_RUN;
@@ -514,9 +560,13 @@ extern "C" int64_t semu_gfx_poll(void) {
       }
     } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
       sdl_ConvertEventToRenderCoordinates(renderer, &event);
-      for (int32_t i = 0; i < 3; ++i) {
-        if (button_hit(buttons[i], event.button.x, event.button.y)) {
-          action = buttons[i].action;
+      if (inside_screen(event.button.x, event.button.y)) {
+        screen_focus = !screen_focus;
+      } else if (!screen_focus) {
+        for (int32_t i = 0; i < 3; ++i) {
+          if (button_hit(buttons[i], event.button.x, event.button.y)) {
+            action = buttons[i].action;
+          }
         }
       }
     }
@@ -559,14 +609,21 @@ extern "C" int64_t semu_input_state(void) {
   }
 
   int64_t mask = 0;
+  const bool cpu_input = screen_focus;
   if (keys[SDL_SCANCODE_X]) mask |= 0x01;
+  if (cpu_input && keys[SDL_SCANCODE_SPACE]) mask |= 0x01;
   if (keys[SDL_SCANCODE_Z]) mask |= 0x02;
+  if (cpu_input && keys[SDL_SCANCODE_J]) mask |= 0x02;
   if (keys[SDL_SCANCODE_RSHIFT]) mask |= 0x04;
   if (keys[SDL_SCANCODE_RETURN]) mask |= 0x08;
   if (keys[SDL_SCANCODE_UP]) mask |= 0x10;
+  if (cpu_input && keys[SDL_SCANCODE_W]) mask |= 0x10;
   if (keys[SDL_SCANCODE_DOWN]) mask |= 0x20;
+  if (cpu_input && keys[SDL_SCANCODE_S]) mask |= 0x20;
   if (keys[SDL_SCANCODE_LEFT]) mask |= 0x40;
+  if (cpu_input && keys[SDL_SCANCODE_A]) mask |= 0x40;
   if (keys[SDL_SCANCODE_RIGHT]) mask |= 0x80;
+  if (cpu_input && keys[SDL_SCANCODE_D]) mask |= 0x80;
   return mask;
 }
 

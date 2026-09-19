@@ -178,6 +178,7 @@ class Assembler:
     operand_text: str
     operand_value: i64
     line_no: i64
+    scope: str
 
     def __init__(self, origin: i64) -> void:
         self.image = bytes.zeros(IMAGE_SIZE)
@@ -191,6 +192,7 @@ class Assembler:
         self.operand_text = ""
         self.operand_value = 0
         self.line_no = 0
+        self.scope = ""
 
     # --- driving -----------------------------------------------------------
 
@@ -268,14 +270,31 @@ class Assembler:
     def define_label(self, name: str, value: i64) -> void:
         if self.pass2:
             return
-        if self.lookup_label(name) >= 0:
+        if len(self.scope) > 0:
+            # Inside .proc a label is also reachable unqualified, which keeps
+            # plain references like "BNE loop" working.
+            self.add_label(self.scope + name, value)
+            if self.find_label(name) < 0:
+                self.add_label(name, value)
+            return
+        if self.find_label(name) >= 0:
             self.fail(f"label '{name}' is already defined")
             return
-        self.labels = self.labels + name + "=" + self.dec(value) + ";"
+        self.add_label(name, value)
+
+    def add_label(self, key: str, value: i64) -> void:
+        self.labels = self.labels + key + "=" + self.dec(value) + ";"
 
     def lookup_label(self, name: str) -> i64:
         if len(name) == 0:
             return -1
+        if len(self.scope) > 0:
+            scoped = self.find_label(self.scope + name)
+            if scoped >= 0:
+                return scoped
+        return self.find_label(name)
+
+    def find_label(self, name: str) -> i64:
         needle = name + "="
         start = 0
         while start < i32(len(self.labels)):
@@ -492,6 +511,20 @@ class Assembler:
                 self.fail(".equ needs a name and a value")
                 return
             self.define_label(string.strip(args[:comma]), self.eval(args[comma + 1:]))
+            return
+        if name == ".PROC" or name == ".SCOPE":
+            label = string.strip(args)
+            self.scope = label + "."
+            if len(label) > 0:
+                self.define_label(label, self.pc)
+            return
+        if name == ".ENDPROC" or name == ".ENDSCOPE":
+            self.scope = ""
+            return
+        # Segment directives do not move the flat image this assembler builds.
+        if name == ".SEGMENT" or name == ".CODE" or name == ".DATA":
+            return
+        if name == ".BSS" or name == ".ZEROPAGE" or name == ".RODATA":
             return
         self.fail(f"unknown directive '{name}'")
 

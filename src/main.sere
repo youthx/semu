@@ -1,10 +1,19 @@
+import bytes
+import env
+import fs
 import log
+import string
 
+import asm6502
 import processor
-from graphics import gfx_blit, gfx_frame, gfx_init, gfx_poll, gfx_shutdown
+from graphics import gfx_blit, gfx_frame, gfx_init, gfx_poll, gfx_shutdown, input_state
 from graphics import ACTION_FASTER, ACTION_QUIT, ACTION_RESET, ACTION_SLOWER, ACTION_STEP, ACTION_TOGGLE_RUN
 from graphics import STATE_READY, STATE_ERROR, STATE_HALTED, STATE_PAUSED, STATE_RUNNING
 from vm import PROGRAM_START, VM
+
+# Where the host keyboard is published for the CPU to read. The NES uses $4016
+# for controller 1, so programs written for that port work unchanged.
+const INPUT_PORT: i64 = 0x4016
 
 const MEMORY_SIZE: i64 = 65536
 const HEX_DIGITS: str = "0123456789ABCDEF"
@@ -33,79 +42,193 @@ def hex_word(value: i64) -> str:
     return hex_byte((value >> 8) & 0xFF) + hex_byte(value & 0xFF)
 
 
-# Hand-assembled demo program. Zero page $10 is a frame counter; every pass it
-# paints a bright pixel on the top row of video memory and dims the pixel eight
-# columns behind it, so a bar sweeps across the screen.
-#
-#   $1000  LDA #$00
-#   $1002  STA $10          ; counter = 0
-#   $1004  loop: LDA $10
-#   $1006        AND #$7F    ; column = counter & 127
-#   $1008        TAY
-#   $1009        LDA #$FF    ; bright pixel
-#   $100B        STA $4000,Y
-#   $100E        TYA
-#   $100F        SEC
-#   $1010        SBC #$08    ; trail pixel eight columns behind
-#   $1012        AND #$7F
-#   $1014        TAY
-#   $1015        LDA #$18    ; dim pixel
-#   $1017        STA $4000,Y
-#   $101A        INC $10
-#   $101C        JMP loop
-const ROM = [
-    # $1000  LDA #$00
-    0xA9, 0x00,
-    # $1002  STA $10
-    0x85, 0x10,
-    # $1004  LDA $10
-    0xA5, 0x10,
-    # $1006  AND #$7F
-    0x29, 0x7F,
-    # $1008  TAY
-    0xA8,
-    # $1009  LDA #$FF
-    0xA9, 0xFF,
-    # $100B  STA $4000,Y
-    0x99, 0x00, 0x40,
-    # $100E  TYA
-    0x98,
-    # $100F  SEC
-    0x38,
-    # $1010  SBC #$08
-    0xE9, 0x08,
-    # $1012  AND #$7F
-    0x29, 0x7F,
-    # $1014  TAY
-    0xA8,
-    # $1015  LDA #$18
-    0xA9, 0x18,
-    # $1017  STA $4000,Y
-    0x99, 0x00, 0x40,
-    # $101A  INC $10
-    0xE6, 0x10,
-    # $101C  JMP $1004
-    0x4C, 0x04, 0x10,
-]
+def newline() -> str:
+    return bytes.to_str(bytes.from_hex("0A"))
 
 
-# Colour the screen before the program runs: a grid of RGB332 blocks.
-def paint_background() -> void:
-    y = 0
-    while y < SCREEN_H:
-        x = 0
-        while x < SCREEN_W:
-            color = (((x >> 4) & 0x07) << 5) | (((y >> 4) & 0x07) << 2) | 0x03
-            vm.write(SCREEN_BASE + y * SCREEN_W + x, color as byte)
-            x += 1
-        y += 1
+# --- program selection -----------------------------------------------------
+# A program can come from SEMU_PROGRAM or from the command line:
+#   sere run -- game.s --org=0x8000
+# Without either, the built in demo below is assembled and run.
+
+def program_path(argv: list[str]) -> str:
+    from_env = env.get("SEMU_PROGRAM")
+    if len(from_env) > 0:
+        return from_env
+    i = 1
+    while i < i32(len(argv)):
+        arg = argv[i]
+        if not string.starts_with(arg, "--"):
+            return arg
+        i += 1
+    return ""
 
 
-def load_demo() -> void:
+def program_origin(argv: list[str]) -> i64:
+    i = 1
+    while i < i32(len(argv)):
+        arg = argv[i]
+        if string.starts_with(arg, "--org="):
+            return parse_address(arg[6:])
+        i += 1
+    return PROGRAM_START
+
+
+def parse_address(text: str) -> i64:
+    body = string.strip(text)
+    if len(body) == 0:
+        return PROGRAM_START
+    if body[0] == "$":
+        return hex_digits(body[1:])
+    if string.starts_with(string.upper(body), "0X"):
+        return hex_digits(body[2:])
+    return decimal_digits(body)
+
+
+def hex_digits(text: str) -> i64:
+    digits = "0123456789ABCDEF"
+    value = 0
+    i = 0
+    while i < i32(len(text)):
+        glyph = string.upper(text[i])
+        digit = 0
+        while digit < 16:
+            if glyph == digits[digit]:
+                break
+            digit += 1
+        value = value * 16 + digit
+        i += 1
+    return value
+
+
+def decimal_digits(text: str) -> i64:
+    value = 0
+    i = 0
+    while i < i32(len(text)) and text[i] >= "0" and text[i] <= "9":
+        value = value * 10 + hex_digits(text[i])
+        i += 1
+    return value
+
+
+def has_suffix(name: str, suffix: str) -> bool:
+    if len(name) < len(suffix):
+        return False
+    return string.upper(name[len(name) - len(suffix):]) == string.upper(suffix)
+
+
+# Built in demo, assembled by asm6502 at startup. It clears the screen, reads
+# the host keyboard from $4016 and draws a bar you can steer with the arrow
+# keys, repainting it with X (A button) or Z (B button).
+const DEMO = """
+PORT  = $4016
+POS   = $10
+COLOR = $11
+
+        LDA #$40
+        STA POS
+        LDA #$3C
+        STA COLOR
+
+loop:
+        JSR clear
+        JSR read_pad
+        LDX POS
+        LDA COLOR
+        STA $4000,X
+        JMP loop
+
+read_pad:
+        LDA PORT
+        AND #%01000000
+        BEQ pad_right
+        DEC POS
+pad_right:
+        LDA PORT
+        AND #%10000000
+        BEQ pad_up
+        INC POS
+pad_up:
+        LDA PORT
+        AND #%00010000
+        BEQ pad_down
+        INC COLOR
+pad_down:
+        LDA PORT
+        AND #%00100000
+        BEQ pad_a
+        DEC COLOR
+pad_a:
+        LDA PORT
+        AND #%00000001
+        BEQ pad_end
+        LDA #$E0
+        STA COLOR
+pad_end:
+        RTS
+
+clear:
+        LDX #$00
+        LDA #$00
+clr:
+        STA $4000,X
+        INX
+        CPX #$80
+        BNE clr
+        RTS
+"""
+
+
+# Video memory is black until a program draws to it.
+def clear_screen() -> void:
+    i = 0
+    while i < SCREEN_W * SCREEN_H:
+        vm.write(SCREEN_BASE + i, 0 as byte)
+        i += 1
+
+
+# Assemble source and load the result at `origin`.
+def load_source(source: str, origin: i64) -> bool:
+    program = asm6502.assemble(source, origin)
+    if not program.ok():
+        logger.error("assembly failed:" + newline() + program.errors)
+        return False
+    logger.info(f"assembled {program.size} bytes at ${hex_word(origin)}")
+    vm.load(asm6502.code_window(program), origin)
+    return True
+
+
+# Load a program file: .s/.asm/.a65 source, a .hex dump, or a raw .bin image.
+def load_path(path: str, origin: i64) -> bool:
+    if has_suffix(path, ".nes"):
+        logger.error(".nes ROMs need the NES bus, mappers and PPU first")
+        return False
+    text = fs.read_text(path)
+    if len(text) == 0:
+        logger.error(f"could not read {path}")
+        return False
+    if has_suffix(path, ".s") or has_suffix(path, ".asm") or has_suffix(path, ".a65"):
+        return load_source(text, origin)
+    image: list[byte] = bytes.zeros(0)
+    if has_suffix(path, ".hex"):
+        image = bytes.from_hex(text)
+    else:
+        image = bytes.from_str(text)
+    logger.info(f"loaded {len(image)} bytes from {path} at ${hex_word(origin)}")
+    vm.load(image, origin)
+    return True
+
+
+def load_program(argv: list[str]) -> void:
     vm.reset(PROGRAM_START)
-    vm.load(ROM)
-    paint_background()
-    vm.run()
+    clear_screen()
+    path = program_path(argv)
+    if len(path) > 0:
+        if load_path(path, program_origin(argv)):
+            vm.run()
+            return
+        logger.error("falling back to the built in demo")
+    if load_source(DEMO, PROGRAM_START):
+        vm.run()
 
 
 # Fetch, decode and run one instruction. The machine is passed as &vm so the
@@ -135,12 +258,12 @@ def blit_screen() -> void:
         chunk += 1
 
 
-def main() -> i32:
+def main(argv: list[str]) -> i32:
     if gfx_init(SCREEN_W, SCREEN_H, SCREEN_ZOOM) == 0:
         logger.error("could not open an SDL3 window (is SDL3.dll available?)")
         return 1
 
-    load_demo()
+    load_program(argv)
 
     paused = False
     failed = False
@@ -155,17 +278,17 @@ def main() -> i32:
             if paused:
                 paused = False
                 if not vm.is_running():
-                    load_demo()
+                    load_program(argv)
             else:
                 paused = True
         elif action == ACTION_STEP:
             paused = True
             if not vm.is_running():
-                load_demo()
+                load_program(argv)
             step()
             blit_screen()
         elif action == ACTION_RESET:
-            load_demo()
+            load_program(argv)
             failed = False
             paused = False
         elif action == ACTION_FASTER:
@@ -174,6 +297,9 @@ def main() -> i32:
         elif action == ACTION_SLOWER:
             if speed > MIN_SPEED:
                 speed = speed >> 1
+
+        # Publish the host keyboard on the controller port the CPU reads.
+        vm.write(INPUT_PORT, input_state() as byte)
 
         if not paused:
             used = 0

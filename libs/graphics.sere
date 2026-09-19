@@ -17,11 +17,6 @@ def gfx_shutdown() -> void
 extern "C" "semu_gfx_poll"
 def gfx_poll() -> i64
 
-# The host keyboard as a NES style controller byte: A, B, Select, Start, Up,
-# Down, Left, Right on bits 0 to 7.
-extern "C" "semu_input_state"
-def input_state() -> i64
-
 # Uploads eight consecutive screen bytes; `packed` is little endian.
 extern "C" "semu_gfx_blit"
 def gfx_blit(index: i64, packed: i64) -> void

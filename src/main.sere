@@ -380,9 +380,10 @@ def compile_only(argv: list[str], out_path: str) -> i32:
 
 def main(argv: list[str]) -> i32:
     if has_option(argv, "--dump-cpu"):
-        print(processor.dump_table())
-        logger.info(f"{processor.implemented_count()} opcodes implemented")
-        missing = processor.missing_opcodes()
+        logger.info(f"table entries: {processor.table_size()}")
+        print(processor.dump_table(&vm))
+        logger.info(f"{processor.implemented_count(&vm)} opcodes implemented")
+        missing = processor.missing_opcodes(&vm)
         if len(missing) > 0:
             logger.info(f"no entry for: {missing}")
         return 0

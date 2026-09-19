@@ -1,4 +1,7 @@
 Sere project: semu
+
+[![Snake Demo](https://img.youtube.com/vi/h7DXPSAKZqw/hqdefault.jpg)](https://youtu.be/h7DXPSAKZqw)
+
 ====================
 src/       Sere sources (entry: src/main.sere)
 libs/      Sere modules and native C++ extensions

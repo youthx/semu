@@ -985,41 +985,42 @@ def hex_byte(value: i64) -> str:
     return digits[(value >> 4) & 0x0F] + digits[value & 0x0F]
 
 
-# The 256 opcode values, built one hex pair at a time so every entry is a real
-# byte value.
-def opcode_values() -> list[byte]:
-    data = bytes.zeros(0)
-    value = 0
-    while value < 256:
-        data = bytes.concat(data, bytes.from_hex(hex_byte(value)))
-        value += 1
-    return data
+# Scratch address the audit uses to build an opcode byte.
+const AUDIT_ADDRESS: i64 = 0x02FF
 
 
-# The opcode table is keyed by a byte, and only a byte that was declared
-# together with its value works as a key: `x as byte`, a `bytes.get` call
-# written inline and even assigning to a byte variable afterwards all miss the
-# table. These two helpers are the only place the table is read by number.
-def implemented_at(codes: list[byte], index: i64) -> bool:
-    opcode: byte = bytes.get(codes, index)
+# How many opcodes the table holds, for a quick sanity check from the CLI.
+def table_size() -> i64:
+    return len(INST_MAP)
+
+
+# Table reads only answer when the key reaches the lookup as a `byte`
+# parameter, which is exactly how `execute` receives its opcode. A key built
+# inline, cast with `as byte` or stored in a local all miss the table.
+def has_entry(opcode: byte) -> bool:
     return INST_MAP.get(opcode) is not None
 
 
-def name_at(codes: list[byte], index: i64) -> str:
-    opcode: byte = bytes.get(codes, index)
+def entry_name(opcode: byte) -> str:
     entry = INST_MAP.get(opcode)
     if entry is None:
         return ""
     return str(entry)
 
 
+# The audit walks all 256 values through a scratch byte in RAM so the key has
+# the same shape as the `byte` parameter above.
+def audit_key(vm: Ptr[VM], index: i64) -> byte:
+    (*vm).write(AUDIT_ADDRESS, index as byte)
+    return (*vm).read(AUDIT_ADDRESS)
+
+
 # One line per implemented opcode, so the table can be audited from the CLI.
-def dump_table() -> str:
-    codes = opcode_values()
+def dump_table(vm: Ptr[VM]) -> str:
     lines = ""
     index = 0
     while index < 256:
-        name = name_at(codes, index)
+        name = entry_name(audit_key(vm, index))
         if len(name) > 0:
             lines = lines + f"${hex_byte(index)}  {name}" + bytes.to_str(bytes.from_hex("0A"))
         index += 1
@@ -1027,23 +1028,21 @@ def dump_table() -> str:
 
 
 # Opcodes the table has no entry for, as a space separated hex list.
-def missing_opcodes() -> str:
-    codes = opcode_values()
+def missing_opcodes(vm: Ptr[VM]) -> str:
     text = ""
     index = 0
     while index < 256:
-        if not implemented_at(codes, index):
+        if not has_entry(audit_key(vm, index)):
             text = text + hex_byte(index) + " "
         index += 1
     return text
 
 
-def implemented_count() -> i64:
-    codes = opcode_values()
+def implemented_count(vm: Ptr[VM]) -> i64:
     count = 0
     index = 0
     while index < 256:
-        if implemented_at(codes, index):
+        if has_entry(audit_key(vm, index)):
             count += 1
         index += 1
     return count

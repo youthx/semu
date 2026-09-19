@@ -12,6 +12,29 @@ extern "C" __declspec(dllimport) void* __stdcall LoadLibraryA(const char* file_n
 extern "C" __declspec(dllimport) void* __stdcall GetProcAddress(void* module, const char* name);
 // Declare memcpy without pulling in <string.h>.
 extern "C" void* memcpy(void* dst, const void* src, size_t n);
+extern "C" __declspec(dllimport) void* __stdcall CreateFileA(const char* name, uint32_t access,
+                                                                uint32_t share, void* security,
+                                                                uint32_t creation, uint32_t flags,
+                                                                void* template_file);
+extern "C" __declspec(dllimport) int32_t __stdcall ReadFile(void* handle, void* buffer,
+                                                              uint32_t length, uint32_t* read,
+                                                              void* overlapped);
+extern "C" __declspec(dllimport) int32_t __stdcall WriteFile(void* handle, const void* buffer,
+                                                               uint32_t length, uint32_t* written,
+                                                               void* overlapped);
+extern "C" __declspec(dllimport) int32_t __stdcall FlushFileBuffers(void* handle);
+extern "C" __declspec(dllimport) int32_t __stdcall CloseHandle(void* handle);
+extern "C" __declspec(dllimport) uint32_t __stdcall SetFilePointer(void* handle, int32_t distance,
+                                                                     int32_t* high, uint32_t method);
+
+static const uint32_t SEMU_GENERIC_READ = 0x80000000u;
+static const uint32_t SEMU_GENERIC_WRITE = 0x40000000u;
+static const uint32_t SEMU_FILE_SHARE_READ = 0x00000001u;
+static const uint32_t SEMU_FILE_SHARE_WRITE = 0x00000002u;
+static const uint32_t SEMU_OPEN_EXISTING = 3u;
+static const uint32_t SEMU_OPEN_ALWAYS = 4u;
+static const uint32_t SEMU_FILE_BEGIN = 0u;
+static void* const SEMU_INVALID_HANDLE = (void*)(intptr_t)-1;
 
 // SDL3 entry points declared in SDL_test_font.h and SDL_timer.h, which are not
 // worth including here because they pull in more CRT headers.
@@ -113,6 +136,149 @@ enum {
   STATE_ERROR = 4,
   STATE_ENDED = 5,
 };
+
+// --- memory-mapped storage devices ----------------------------------------
+
+static const int32_t SRAM_SIZE = 8192;
+static const int32_t BANK_SIZE = 8192;
+static const int32_t BANK_COUNT = 4;
+static const int32_t DISK_BLOCK_SIZE = 256;
+static const int32_t DISK_BLOCK_COUNT = 1024;
+static const int64_t STORAGE_NOT_MAPPED = -1;
+
+static uint8_t storage_sram[SRAM_SIZE];
+static uint8_t storage_prg[BANK_SIZE * BANK_COUNT];
+static uint8_t storage_chr[BANK_SIZE * BANK_COUNT];
+static uint8_t storage_block[DISK_BLOCK_SIZE];
+static uint8_t storage_disk[DISK_BLOCK_SIZE * DISK_BLOCK_COUNT];
+static int32_t storage_prg_bank = 0;
+static int32_t storage_chr_bank = 0;
+static int32_t storage_block_lo = 0;
+static int32_t storage_block_mid = 0;
+static int32_t storage_block_hi = 0;
+static int32_t storage_status = 0x01;
+static int32_t storage_command = 0;
+static int64_t storage_busy_cycles = 0;
+static bool storage_initialized = false;
+
+static bool storage_read_file(const char* path, uint8_t* buffer, uint32_t size) {
+  void* handle = CreateFileA(path, SEMU_GENERIC_READ, SEMU_FILE_SHARE_READ | SEMU_FILE_SHARE_WRITE,
+                             nullptr, SEMU_OPEN_EXISTING, 0, nullptr);
+  if (handle == SEMU_INVALID_HANDLE) return false;
+  uint32_t read = 0;
+  const bool ok = ReadFile(handle, buffer, size, &read, nullptr) != 0;
+  CloseHandle(handle);
+  return ok && read == size;
+}
+
+static bool storage_write_file(const char* path, const uint8_t* buffer, uint32_t size) {
+  void* handle = CreateFileA(path, SEMU_GENERIC_WRITE, SEMU_FILE_SHARE_READ,
+                             nullptr, SEMU_OPEN_ALWAYS, 0, nullptr);
+  if (handle == SEMU_INVALID_HANDLE) return false;
+  int32_t high = 0;
+  SetFilePointer(handle, 0, &high, SEMU_FILE_BEGIN);
+  uint32_t written = 0;
+  const bool ok = WriteFile(handle, buffer, size, &written, nullptr) != 0;
+  FlushFileBuffers(handle);
+  CloseHandle(handle);
+  return ok && written == size;
+}
+
+static void storage_finish_command(void) {
+  const int64_t block_id = storage_block_lo | (storage_block_mid << 8) | (storage_block_hi << 16);
+  if (block_id < 0 || block_id >= DISK_BLOCK_COUNT) {
+    storage_status = 0x80;
+  } else if (storage_command == 0x01) {
+    memcpy(storage_block, &storage_disk[block_id * DISK_BLOCK_SIZE], DISK_BLOCK_SIZE);
+    storage_status = 0x01;
+  } else if (storage_command == 0x02) {
+    memcpy(&storage_disk[block_id * DISK_BLOCK_SIZE], storage_block, DISK_BLOCK_SIZE);
+    storage_write_file("semu.disk", storage_disk, sizeof(storage_disk));
+    storage_status = 0x01;
+  } else if (storage_command == 0x03) {
+    storage_write_file("semu.sram", storage_sram, sizeof(storage_sram));
+    storage_write_file("semu.disk", storage_disk, sizeof(storage_disk));
+    storage_status = 0x01;
+  } else {
+    storage_status = 0x80;
+  }
+}
+
+extern "C" void semu_storage_init(void) {
+  if (storage_initialized) return;
+  storage_initialized = true;
+  for (int32_t i = 0; i < SRAM_SIZE; ++i) storage_sram[i] = 0;
+  for (int32_t i = 0; i < BANK_SIZE * BANK_COUNT; ++i) {
+    storage_prg[i] = 0xFF;
+    storage_chr[i] = 0x00;
+  }
+  for (int32_t i = 0; i < DISK_BLOCK_SIZE * DISK_BLOCK_COUNT; ++i) storage_disk[i] = 0;
+  storage_read_file("semu.sram", storage_sram, sizeof(storage_sram));
+  storage_read_file("semu.prg", storage_prg, sizeof(storage_prg));
+  storage_read_file("semu.chr", storage_chr, sizeof(storage_chr));
+  storage_read_file("semu.disk", storage_disk, sizeof(storage_disk));
+}
+
+extern "C" void semu_storage_flush(void) {
+  semu_storage_init();
+  storage_write_file("semu.sram", storage_sram, sizeof(storage_sram));
+  storage_write_file("semu.disk", storage_disk, sizeof(storage_disk));
+}
+
+extern "C" int64_t semu_storage_read(int64_t address) {
+  semu_storage_init();
+  const int32_t a = (int32_t)(address & 0xFFFF);
+  if (a >= 0xA000 && a <= 0xBFFF) return storage_sram[a - 0xA000];
+  if (a == 0x5D00) return storage_prg_bank;
+  if (a == 0x5D01) return storage_chr_bank;
+  if (a == 0x5D03) return 0x4D;
+  if (a >= 0x8000 && a <= 0x9FFF) return storage_prg[storage_prg_bank * BANK_SIZE + a - 0x8000];
+  if (a >= 0xC000 && a <= 0xDFFF) return storage_chr[storage_chr_bank * BANK_SIZE + a - 0xC000];
+  if (a == 0x5E00) return storage_command;
+  if (a == 0x5E01) return storage_status;
+  if (a == 0x5E02) return storage_block_lo;
+  if (a == 0x5E03) return storage_block_mid;
+  if (a == 0x5E04) return storage_block_hi;
+  if (a == 0x5E05) return 0xA5;
+  if (a == 0x5E06) return 0x01;
+  if (a == 0x5E07) return 0x00;
+  if (a >= 0x5F00 && a <= 0x5FFF) return storage_block[a - 0x5F00];
+  return STORAGE_NOT_MAPPED;
+}
+
+extern "C" int64_t semu_storage_write(int64_t address, int64_t value) {
+  semu_storage_init();
+  const int32_t a = (int32_t)(address & 0xFFFF);
+  const uint8_t v = (uint8_t)(value & 0xFF);
+  if (a >= 0xA000 && a <= 0xBFFF) {
+    storage_sram[a - 0xA000] = v;
+    return 1;
+  }
+  if (a == 0x5D00) { storage_prg_bank = v % BANK_COUNT; return 1; }
+  if (a == 0x5D01) { storage_chr_bank = v % BANK_COUNT; return 1; }
+  if (a >= 0x8000 && a <= 0x9FFF) return 1;
+  if (a >= 0xC000 && a <= 0xDFFF) {
+    storage_chr[storage_chr_bank * BANK_SIZE + a - 0xC000] = v;
+    return 1;
+  }
+  if (a == 0x5E02) { storage_block_lo = v; return 1; }
+  if (a == 0x5E03) { storage_block_mid = v; return 1; }
+  if (a == 0x5E04) { storage_block_hi = v; return 1; }
+  if (a >= 0x5F00 && a <= 0x5FFF) { storage_block[a - 0x5F00] = v; return 1; }
+  if (a == 0x5E00) {
+    storage_command = v;
+    storage_status = 0x02;
+    storage_busy_cycles = v == 0x02 ? 4000 : 2000;
+    return 1;
+  }
+  return 0;
+}
+
+extern "C" void semu_storage_tick(int64_t cycles) {
+  if (storage_busy_cycles <= 0) return;
+  storage_busy_cycles -= cycles;
+  if (storage_busy_cycles <= 0) storage_finish_command();
+}
 
 // --- window and emulated screen -------------------------------------------
 

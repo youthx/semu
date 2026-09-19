@@ -17,6 +17,21 @@ const FLAG_U: i64 = 0x20
 const FLAG_V: i64 = 0x40
 const FLAG_N: i64 = 0x80
 
+extern "C" "semu_storage_init"
+def storage_init() -> void
+
+extern "C" "semu_storage_read"
+def storage_read(address: i64) -> i64
+
+extern "C" "semu_storage_write"
+def storage_write(address: i64, value: i64) -> i64
+
+extern "C" "semu_storage_tick"
+def storage_tick(cycles: i64) -> void
+
+extern "C" "semu_storage_flush"
+def storage_flush() -> void
+
 
 # A 6502 CPU: registers, status register, stack and 64K of flat memory.
 #
@@ -37,6 +52,7 @@ class VM:
 
     def __init__(self, size: i64) -> None:
         self.memory = bytes.Buffer(size)
+        storage_init()
         self.reset(PROGRAM_START)
 
     # Power-on reset. The real chip loads PC from the reset vector at $FFFC;
@@ -56,9 +72,14 @@ class VM:
             self.pc = entry
 
     def read(self, address: i64) -> byte:
+        mapped = storage_read(address & 0xFFFF)
+        if mapped >= 0:
+            return mapped as byte
         return self.memory[address & 0xFFFF]
 
     def write(self, address: i64, value: byte) -> void:
+        if storage_write(address & 0xFFFF, value as i64) == 1:
+            return
         self.memory.set(address & 0xFFFF, value)
 
     def read_word_at(self, address: i64) -> i64:
@@ -151,6 +172,7 @@ class VM:
     # --- execution ---------------------------------------------------------
     def add_cycles(self, count: i64) -> void:
         self.cycles += count
+        storage_tick(count)
 
     def run(self) -> void:
         self._is_running = True

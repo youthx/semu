@@ -37,6 +37,10 @@ def gfx_get_debug_tab() -> i64
 extern "C" "semu_gfx_set_debug_tab"
 def gfx_set_debug_tab(tab: i64) -> void
 
+# Upload memory bytes to the viewer buffer (8 bytes packed per call, little-endian).
+extern "C" "semu_gfx_blit_memory"
+def gfx_blit_memory(index: i64, packed: i64) -> void
+
 # Pad state from the host keyboard, one bit per button:
 # 0x01 A, 0x02 B, 0x04 Select, 0x08 Start, 0x10 Up, 0x20 Down, 0x40 Left, 0x80 Right.
 extern "C" "semu_input_state"

@@ -147,6 +147,9 @@ static int32_t debug_tab = 0;
 // Memory viewer parameters
 static int64_t mem_view_start = 0x0000;
 static int64_t mem_view_count = 128;
+// Memory viewer buffer (max 256 bytes)
+static uint8_t mem_view_buffer[256];
+static int64_t mem_view_buffer_size = 0;
 
 // --- layout (logical units, the renderer is scaled by UI_SCALE) ------------
 
@@ -154,6 +157,7 @@ static const float UI_SCALE = 2.0f;
 static const float MARGIN = 6.0f;
 static const float PANEL_W = 168.0f;
 static const float LINE_H = 10.0f;
+static const float TAB_H = 14.0f;  // tab bar height
 static const float BUTTON_H = 20.0f;
 static const float BUTTON_Y = 180.0f;
 static const float HINT_Y = 206.0f;
@@ -169,7 +173,7 @@ static const uint32_t COLOR_WARN = 0xFFD866;
 static const uint32_t COLOR_BAD = 0xFF6B6B;
 
 static float panel_x(void) { return MARGIN; }
-static float panel_y(void) { return MARGIN; }
+static float panel_y(void) { return MARGIN + TAB_H; }  // content starts below tabs
 static float screen_x(void) { return MARGIN + PANEL_W + MARGIN; }
 static float screen_y(void) { return MARGIN; }
 static float panel_h(void) { return (float)screen_h * screen_zoom; }
@@ -331,6 +335,30 @@ static void update_fps(void) {
 
 // --- Memory viewer panel ---------------------------------------------------
 
+// Draws the two tab buttons at the very top of the panel.
+static void draw_tabs(void) {
+  const float tab_w = PANEL_W / 2.0f;
+  const float ty = MARGIN;
+  // CPU tab
+  const uint32_t cpu_bg = (debug_tab == 0) ? COLOR_ACCENT : COLOR_PANEL;
+  const uint32_t cpu_fg = (debug_tab == 0) ? COLOR_BG : COLOR_DIM;
+  fill_rect(panel_x(), ty, tab_w, TAB_H, cpu_bg);
+  fill_rect(panel_x(), ty, tab_w, 1.0f, COLOR_BORDER);
+  fill_rect(panel_x(), ty, 1.0f, TAB_H, COLOR_BORDER);
+  fill_rect(panel_x(), ty + TAB_H - 1.0f, tab_w, 1.0f, (debug_tab == 0) ? COLOR_ACCENT : COLOR_BORDER);
+  draw_text("CPU", panel_x() + (tab_w - 24.0f) * 0.5f, ty + 3.0f, cpu_fg);
+  // MEM tab
+  const uint32_t mem_bg = (debug_tab == 1) ? COLOR_ACCENT : COLOR_PANEL;
+  const uint32_t mem_fg = (debug_tab == 1) ? COLOR_BG : COLOR_DIM;
+  fill_rect(panel_x() + tab_w, ty, tab_w, TAB_H, mem_bg);
+  fill_rect(panel_x() + tab_w, ty, tab_w, 1.0f, COLOR_BORDER);
+  fill_rect(panel_x() + tab_w + tab_w - 1.0f, ty, 1.0f, TAB_H, COLOR_BORDER);
+  fill_rect(panel_x() + tab_w, ty + TAB_H - 1.0f, tab_w, 1.0f, (debug_tab == 1) ? COLOR_ACCENT : COLOR_BORDER);
+  draw_text("MEM", panel_x() + tab_w + (tab_w - 24.0f) * 0.5f, ty + 3.0f, mem_fg);
+}
+
+// Panel fits ~19 chars per row (168px / 8px per char).
+// Format: "XXXX: AA BB CC DD" = 18 chars -- exactly fits with 6px margin each side.
 static void draw_memory_viewer(void) {
   fill_rect(panel_x(), panel_y(), PANEL_W, panel_h(), COLOR_PANEL);
   fill_rect(panel_x(), panel_y(), PANEL_W, 1.0f, COLOR_BORDER);
@@ -338,42 +366,37 @@ static void draw_memory_viewer(void) {
   fill_rect(panel_x(), panel_y(), 1.0f, panel_h(), COLOR_BORDER);
   fill_rect(panel_x() + PANEL_W - 1.0f, panel_y(), 1.0f, panel_h(), COLOR_BORDER);
 
+  // Header: "MEMORY" left, start address right
+  char addr_label[8];
+  int32_t alp = 0;
+  write_hex(addr_label, alp, mem_view_start, 4);
+  addr_label[alp] = '\0';
   draw_text("MEMORY", panel_x() + 6.0f, panel_y() + 6.0f, COLOR_ACCENT);
-  draw_text("VIEWER", panel_x() + 6.0f, panel_y() + 6.0f + LINE_H, COLOR_DIM);
+  draw_text(addr_label, panel_x() + PANEL_W - 6.0f - (float)(alp * 8), panel_y() + 6.0f, COLOR_DIM);
 
-  float row = panel_y() + 32.0f;
-
-  // Display memory dump starting at mem_view_start
-  char label[16];
-  int32_t label_pos = 0;
-  write_str(label, label_pos, "0x");
-  write_hex(label, label_pos, mem_view_start, 4);
-  label[label_pos] = '\0';
-
-  draw_text("START", panel_x() + 6.0f, row, COLOR_DIM);
-  draw_text(label, panel_x() + PANEL_W - 6.0f - (float)(label_pos * 8), row, COLOR_TEXT);
-  row += LINE_H;
-
-  // Show sample memory bytes (placeholder - actual memory would be passed from Sere)
-  draw_text("(memory access", panel_x() + 6.0f, row, COLOR_DIM);
-  row += LINE_H;
-  draw_text("from Sere)", panel_x() + 6.0f, row, COLOR_DIM);
-  row += LINE_H + 2.0f;
-
+  float row = panel_y() + 18.0f;
   fill_rect(panel_x() + 6.0f, row, PANEL_W - 12.0f, 1.0f, COLOR_BORDER);
-  row += LINE_H;
+  row += 4.0f;
 
-  char count_text[16];
-  int32_t count_pos = 0;
-  write_dec(count_text, count_pos, mem_view_count);
-  count_text[count_pos] = '\0';
+  // 4 bytes per row: "XXXX: AA BB CC DD"
+  const float max_row = panel_y() + panel_h() - 14.0f;
+  const int32_t count = (int32_t)mem_view_buffer_size;
+  for (int32_t i = 0; i < count && row + LINE_H < max_row; i += 4) {
+    char line[24];
+    int32_t lp = 0;
+    write_hex(line, lp, (int32_t)mem_view_start + i, 4);
+    line[lp++] = ':';
+    for (int32_t j = 0; j < 4 && (i + j) < count; j++) {
+      line[lp++] = ' ';
+      write_hex(line, lp, mem_view_buffer[i + j], 2);
+    }
+    line[lp] = '\0';
+    draw_text(line, panel_x() + 6.0f, row, COLOR_TEXT);
+    row += LINE_H;
+  }
 
-  draw_text("BYTES", panel_x() + 6.0f, row, COLOR_DIM);
-  draw_text(count_text, panel_x() + PANEL_W - 6.0f - (float)(count_pos * 8), row, COLOR_TEXT);
-  row += LINE_H;
-
-  const char* hint = "Press M to toggle CPU mode";
-  draw_text(hint, panel_x() + 6.0f, HINT_Y, COLOR_DIM);
+  fill_rect(panel_x() + 6.0f, max_row - 2.0f, PANEL_W - 12.0f, 1.0f, COLOR_BORDER);
+  draw_text("M: CPU view", panel_x() + 6.0f, max_row, COLOR_DIM);
 }
 
 // --- CPU state panel -------------------------------------------------------
@@ -623,6 +646,16 @@ extern "C" int64_t semu_gfx_poll(void) {
       if (inside_screen(event.button.x, event.button.y)) {
         screen_focus = !screen_focus;
       } else if (!screen_focus) {
+        // Tab bar click
+        const float tab_w = PANEL_W / 2.0f;
+        const float ty = MARGIN;
+        if (event.button.y >= ty && event.button.y < ty + TAB_H) {
+          if (event.button.x >= panel_x() && event.button.x < panel_x() + tab_w) {
+            debug_tab = 0;
+          } else if (event.button.x >= panel_x() + tab_w && event.button.x < panel_x() + PANEL_W) {
+            debug_tab = 1;
+          }
+        }
         for (int32_t i = 0; i < 3; ++i) {
           if (button_hit(buttons[i], event.button.x, event.button.y)) {
             action = buttons[i].action;
@@ -650,7 +683,7 @@ extern "C" void semu_gfx_frame(int64_t a, int64_t x, int64_t y, int64_t sp, int6
   set_color(COLOR_BG);
   sdl_RenderClear(renderer);
 
-  // Draw either CPU state or memory viewer based on active tab
+  draw_tabs();
   if (debug_tab == 0) {
     draw_panel(a, x, y, sp, pc, p, cycles, speed, state);
   } else {
@@ -708,6 +741,20 @@ extern "C" int64_t semu_gfx_get_debug_tab(void) {
 
 extern "C" void semu_gfx_set_debug_tab(int64_t tab) {
   debug_tab = tab ? 1 : 0;
+}
+
+// Update memory viewer buffer with bytes (8 bytes at a time, little-endian packed).
+extern "C" void semu_gfx_blit_memory(int64_t index, int64_t packed) {
+  const uint8_t* src = (const uint8_t*)&packed;
+  int32_t pos = (int32_t)index * 8;
+  if (pos + 8 <= 256) {
+    for (int32_t i = 0; i < 8; i++) {
+      mem_view_buffer[pos + i] = src[i];
+    }
+    if (pos + 8 > mem_view_buffer_size) {
+      mem_view_buffer_size = pos + 8;
+    }
+  }
 }
 
 // --- Sere runtime registration ---------------------------------------------

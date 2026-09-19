@@ -6,9 +6,10 @@ import string
 
 import asm6502
 import processor
-from graphics import gfx_blit, gfx_frame, gfx_init, gfx_poll, gfx_shutdown, input_state
+from graphics import gfx_blit, gfx_blit_memory, gfx_frame, gfx_init, gfx_poll, gfx_shutdown, input_state
 from graphics import ACTION_FASTER, ACTION_QUIT, ACTION_RESET, ACTION_SLOWER, ACTION_STEP, ACTION_TOGGLE_RUN
 from graphics import STATE_READY, STATE_ERROR, STATE_HALTED, STATE_PAUSED, STATE_RUNNING, STATE_ENDED
+from graphics import gfx_set_memory_view, gfx_get_debug_tab
 from vm import PROGRAM_START, VM
 
 # Where the host keyboard is published for the CPU to read. The NES uses $4016
@@ -20,11 +21,8 @@ const HEX_DIGITS: str = "0123456789ABCDEF"
 
 const VERSION: str = "0.1.0"
 const SEMU_LOGO: str = """
-      _____ ______  ___  ___  _   __
-     / ___// ____/ |  \\/  / | | / /
-     \\__ \\/ __/    | |\\  /  | |/ /
-    ___/ / /___    | | \\/ \\  |   <
-   /____/_____/    |_|\\/\\_\\ |_|\\_\\
+S E M U
+6502 Emulator
 """
 
 # Video memory: 128x128 pixels, one RGB332 byte per pixel, at $4000-$7FFF.
@@ -380,6 +378,23 @@ def blit_screen() -> void:
         chunk += 1
 
 
+# Upload memory bytes to the debug memory viewer (8 bytes per call, up to 256 bytes).
+def blit_memory() -> void:
+    chunk = 0
+    while chunk < 32:
+        base = chunk * 8
+        packed = vm.read(base) as i64
+        packed = packed | ((vm.read(base + 1) as i64) << 8)
+        packed = packed | ((vm.read(base + 2) as i64) << 16)
+        packed = packed | ((vm.read(base + 3) as i64) << 24)
+        packed = packed | ((vm.read(base + 4) as i64) << 32)
+        packed = packed | ((vm.read(base + 5) as i64) << 40)
+        packed = packed | ((vm.read(base + 6) as i64) << 48)
+        packed = packed | ((vm.read(base + 7) as i64) << 56)
+        gfx_blit_memory(chunk, packed)
+        chunk += 1
+
+
 def option_value(argv: list[str], prefix: str) -> str:
     i = 1
     while i < i32(len(argv)):
@@ -434,6 +449,11 @@ def compile_only(argv: list[str], out_path: str) -> i32:
 
 
 def main(argv: list[str]) -> i32:
+    # Show help if no arguments provided (just program name)
+    if len(argv) == 1:
+        print_help()
+        return 0
+
     if has_option(argv, "--help") or has_option(argv, "-h"):
         print_help()
         return 0
@@ -539,7 +559,11 @@ def main(argv: list[str]) -> i32:
         else:
             state = STATE_RUNNING
 
+        # Always update memory buffer so it's ready when viewer is toggled
+        blit_memory()
+
         gfx_frame(vm.A, vm.X, vm.Y, vm.SP, vm.pc, vm.P, vm.cycles, speed, state)
 
     gfx_shutdown()
     return 0
+

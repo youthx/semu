@@ -91,6 +91,12 @@ The Windows application icon and the SDL window icon use the SEMU artwork in
 `assets/`. The SVG is the editable source; the PNG is convenient for README
 and release pages; the ICO is used by Windows.
 
+## Detailed documentation
+
+The longer technical notes live in [`docs/`](docs/README.md). They cover the
+memory map, bus behavior, assembler syntax, command-line modes, debugger
+layouts, and persistent storage registers.
+
 ## Why this exists
 
 The interesting part is keeping the boundary honest. A 6502 program should see

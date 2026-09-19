@@ -14,6 +14,4 @@
     DEY
     DEY
     INY
-
 .endproc
-a

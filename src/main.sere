@@ -258,7 +258,62 @@ def blit_screen() -> void:
         chunk += 1
 
 
+def option_value(argv: list[str], prefix: str) -> str:
+    i = 1
+    while i < i32(len(argv)):
+        arg = argv[i]
+        if string.starts_with(arg, prefix):
+            return arg[len(prefix):]
+        i += 1
+    return ""
+
+
+def has_option(argv: list[str], name: str) -> bool:
+    i = 1
+    while i < i32(len(argv)):
+        if argv[i] == name:
+            return True
+        i += 1
+    return False
+
+
+# Assembles a program without opening a window: --check reports it, --out=path
+# writes the bytes as hex text so they can be loaded back as a binary object.
+def compile_only(argv: list[str], out_path: str) -> i32:
+    path = program_path(argv)
+    origin = program_origin(argv)
+    source = DEMO
+    if len(path) > 0:
+        if not (has_suffix(path, ".s") or has_suffix(path, ".asm") or has_suffix(path, ".a65")):
+            logger.error(f"{path} is not an assembly source")
+            return 1
+        source = fs.read_text(path)
+    if len(source) == 0:
+        logger.error(f"could not read {path}")
+        return 1
+    program = asm6502.assemble(source, origin)
+    if not program.ok():
+        logger.error("assembly failed:" + newline() + program.errors)
+        return 1
+    logger.info(f"assembled {program.size} bytes at ${hex_word(origin)}")
+    if len(out_path) > 0:
+        if not fs.write_text(out_path, asm6502.code_hex(program)):
+            logger.error(f"could not write {out_path}")
+            return 1
+        logger.info(f"wrote {out_path}")
+        return 0
+    dump = asm6502.code_hex(program)
+    if len(dump) > 64:
+        dump = dump[:64] + "..."
+    print(f"${hex_word(origin)} {program.size} bytes {dump}")
+    return 0
+
+
 def main(argv: list[str]) -> i32:
+    out_path = option_value(argv, "--out=")
+    if has_option(argv, "--check") or len(out_path) > 0:
+        return compile_only(argv, out_path)
+
     if gfx_init(SCREEN_W, SCREEN_H, SCREEN_ZOOM) == 0:
         logger.error("could not open an SDL3 window (is SDL3.dll available?)")
         return 1
@@ -288,9 +343,11 @@ def main(argv: list[str]) -> i32:
             step()
             blit_screen()
         elif action == ACTION_RESET:
+            # Reload the program but leave the CPU stopped: reset should not
+            # start running again, press RUN or STEP to continue.
             load_program(argv)
             failed = False
-            paused = False
+            paused = True
         elif action == ACTION_FASTER:
             if speed < MAX_SPEED:
                 speed = speed << 1

@@ -29,17 +29,22 @@
 # ALR, ARR, SBX, the multi byte NOPs and the JAM/KIL opcodes).
 
 import bytes
+import fs
 import string
 
 const IMAGE_SIZE: i64 = 0x10000
 
-# Newline and tab without relying on string escape sequences.
+# Newline, tab and unit separator without relying on string escape sequences.
 def newline() -> str:
     return bytes.to_str(bytes.from_hex("0A"))
 
 
 def tab() -> str:
     return bytes.to_str(bytes.from_hex("09"))
+
+
+def unit() -> str:
+    return bytes.to_str(bytes.from_hex("1F"))
 
 # Addressing modes.
 const M_IMP: str = "IMP"
@@ -179,6 +184,17 @@ class Assembler:
     operand_value: i64
     line_no: i64
     scope: str
+    cond_depth: i64
+    cond_active: i64
+    cond_taken: i64
+    exports: str
+    macro_store: str
+    collecting: str
+    collect_params: str
+    collect_body: str
+    collecting_repeat: bool
+    repeat_count: i64
+    repeat_body: str
 
     def __init__(self, origin: i64) -> void:
         self.image = bytes.zeros(IMAGE_SIZE)
@@ -193,6 +209,17 @@ class Assembler:
         self.operand_value = 0
         self.line_no = 0
         self.scope = ""
+        self.cond_depth = 0
+        self.cond_active = 0
+        self.cond_taken = 0
+        self.exports = ""
+        self.macro_store = ""
+        self.collecting = ""
+        self.collect_params = ""
+        self.collect_body = ""
+        self.collecting_repeat = False
+        self.repeat_count = 0
+        self.repeat_body = ""
 
     # --- driving -----------------------------------------------------------
 
@@ -432,6 +459,40 @@ class Assembler:
             text = text[:cut]
         rest = string.strip(text)
 
+        # Macro and repeat bodies are captured verbatim.
+        if len(self.collecting) > 0:
+            if self.directive_name(rest) == ".ENDMACRO":
+                self.finish_macro()
+                return
+            if len(self.collect_body) > 0:
+                self.collect_body = self.collect_body + newline()
+            self.collect_body = self.collect_body + rest
+            return
+
+        if self.collecting_repeat:
+            ender = self.directive_name(rest)
+            if ender == ".ENDREPEAT" or ender == ".ENDR":
+                self.finish_repeat()
+                return
+            if len(self.repeat_body) > 0:
+                self.repeat_body = self.repeat_body + newline()
+            self.repeat_body = self.repeat_body + rest
+            return
+
+        # While a conditional branch is skipped only .if/.else/.endif matter.
+        if not self.executing():
+            taken = self.directive_name(rest)
+            if taken == ".IF" or taken == ".IFDEF" or taken == ".IFNDEF":
+                self.open_condition(rest, taken)
+                return
+            if taken == ".ELSE":
+                self.else_condition()
+                return
+            if taken == ".ENDIF":
+                self.close_condition()
+                return
+            return
+
         # Labels and constants may share a line with an instruction.
         while len(rest) > 0:
             colon = string.find(rest, ":")
@@ -486,11 +547,18 @@ class Assembler:
             if self.pc > self.highest:
                 self.highest = self.pc
             return
-        if name == ".BYTE" or name == ".DB" or name == ".BY":
+        if name == ".BYTE" or name == ".DB" or name == ".BY" or name == ".BYT":
             self.emit_list(args, 1)
             return
         if name == ".WORD" or name == ".DW":
             self.emit_list(args, 2)
+            return
+        if name == ".DBYT":
+            self.emit_list(args, 3)
+            return
+        if name == ".ASCIIZ" or name == ".ASCIZ":
+            self.emit_text(args)
+            self.emit(0)
             return
         if name == ".TEXT" or name == ".ASCII" or name == ".ASC":
             self.emit_text(args)
@@ -512,8 +580,15 @@ class Assembler:
                 return
             self.define_label(string.strip(args[:comma]), self.eval(args[comma + 1:]))
             return
+        if name == ".SET" or name == ".DEFINE":
+            blank = string.find(args, " ")
+            if blank < 0:
+                self.fail(f"{name} needs a name and a value")
+                return
+            self.define_label(string.strip(args[:blank]), self.eval(args[blank + 1:]))
+            return
         if name == ".PROC" or name == ".SCOPE":
-            label = string.strip(args)
+            label = self.strip_quotes(args)
             self.scope = label + "."
             if len(label) > 0:
                 self.define_label(label, self.pc)
@@ -521,12 +596,328 @@ class Assembler:
         if name == ".ENDPROC" or name == ".ENDSCOPE":
             self.scope = ""
             return
-        # Segment directives do not move the flat image this assembler builds.
-        if name == ".SEGMENT" or name == ".CODE" or name == ".DATA":
+        if name == ".EXPORT" or name == ".GLOBAL":
+            self.record_names(args)
             return
-        if name == ".BSS" or name == ".ZEROPAGE" or name == ".RODATA":
+        if name == ".IMPORT" or name == ".EXTERNAL":
+            return
+        if name == ".INCLUDE":
+            self.include_file(args)
+            return
+        if name == ".INCBIN":
+            self.incbin_file(args)
+            return
+        if name == ".MACRO":
+            blank = string.find(args, " ")
+            if blank < 0:
+                self.collecting = string.strip(args)
+                self.collect_params = ""
+            else:
+                self.collecting = string.strip(args[:blank])
+                self.collect_params = string.strip(args[blank + 1:])
+            self.collect_body = ""
+            return
+        if name == ".ENDMACRO":
+            self.finish_macro()
+            return
+        if name == ".REPEAT" or name == ".REP":
+            self.collecting_repeat = True
+            self.repeat_count = self.eval(args)
+            self.repeat_body = ""
+            return
+        if name == ".ENDREPEAT" or name == ".ENDR":
+            self.finish_repeat()
+            return
+        if name == ".IF" or name == ".IFDEF" or name == ".IFNDEF":
+            self.open_condition(text, name)
+            return
+        if name == ".ELSE":
+            self.else_condition()
+            return
+        if name == ".ENDIF":
+            self.close_condition()
+            return
+        # Segments, processor flags and debug info do not move the flat image.
+        if name == ".SEGMENT" or name == ".CODE" or name == ".DATA" or name == ".BSS":
+            return
+        if name == ".ZEROPAGE" or name == ".RODATA" or name == ".LOCAL":
+            return
+        if name == ".A8" or name == ".A16" or name == ".I8" or name == ".I16":
+            return
+        if name == ".P02" or name == ".P816" or name == ".FEATURE" or name == ".DEBUGINFO":
             return
         self.fail(f"unknown directive '{name}'")
+
+    # Text after the directive keyword, e.g. the "Main" in .export "Main".
+    def args_of(self, text: str) -> str:
+        space = string.find(text, " ")
+        if space < 0:
+            return ""
+        return string.strip(text[space + 1:])
+
+    # The name of a directive line, upper cased, or "" when it is not one.
+    def directive_name(self, text: str) -> str:
+        body = string.strip(text)
+        if len(body) == 0 or body[0] != ".":
+            return ""
+        space = string.find(body, " ")
+        if space < 0:
+            return string.upper(body)
+        return string.upper(body[:space])
+
+    def strip_quotes(self, text: str) -> str:
+        body = string.strip(text)
+        mark = self.quote()
+        if len(body) >= 2 and body[0] == mark:
+            if body[len(body) - 1] == mark:
+                return body[1:len(body) - 1]
+        return body
+
+    # --- conditional assembly ----------------------------------------------
+
+    def executing(self) -> bool:
+        if self.cond_depth == 0:
+            return True
+        full = (1 << self.cond_depth) - 1
+        return (self.cond_active & full) == full
+
+    def cond_outer_for(self, depth: i64) -> bool:
+        if depth == 0:
+            return True
+        full = (1 << depth) - 1
+        return (self.cond_active & full) == full
+
+    def open_condition(self, text: str, name: str) -> void:
+        depth = self.cond_depth
+        outer = self.cond_outer_for(depth)
+        result = False
+        if outer:
+            args = self.args_of(text)
+            if name == ".IF":
+                result = self.eval_condition(args) != 0
+            elif name == ".IFDEF":
+                result = self.symbol_defined(args)
+            else:
+                result = not self.symbol_defined(args)
+        if result:
+            self.cond_active = self.cond_active | (1 << depth)
+            self.cond_taken = self.cond_taken | (1 << depth)
+        else:
+            self.cond_active = self.cond_active & ~(1 << depth)
+        self.cond_depth = depth + 1
+
+    def symbol_defined(self, args: str) -> bool:
+        name = self.strip_quotes(string.strip(args))
+        if len(name) == 0:
+            return False
+        return self.find_label(name) >= 0
+
+    def else_condition(self) -> void:
+        if self.cond_depth == 0:
+            self.fail(".else without .if")
+            return
+        depth = self.cond_depth - 1
+        bit = 1 << depth
+        if self.cond_taken & bit != 0:
+            self.cond_active = self.cond_active & ~bit
+            return
+        if self.cond_outer_for(depth):
+            self.cond_active = self.cond_active | bit
+            self.cond_taken = self.cond_taken | bit
+            return
+        self.cond_active = self.cond_active & ~bit
+
+    def close_condition(self) -> void:
+        if self.cond_depth == 0:
+            self.fail(".endif without .if")
+            return
+        depth = self.cond_depth - 1
+        bit = 1 << depth
+        self.cond_active = self.cond_active & ~bit
+        self.cond_taken = self.cond_taken & ~bit
+        self.cond_depth = depth
+
+    # Conditions accept a plain expression, .ifdef style symbol tests, and the
+    # comparisons =, <>, <, >, <= and >= written with spaces around them.
+    def eval_condition(self, text: str) -> i64:
+        body = string.strip(text)
+        if len(body) == 0:
+            return 0
+        operators = ["<>", "<=", ">=", "=", "<", ">"]
+        i = 0
+        while i < 6:
+            operator = operators[i]
+            at = string.find(body, " " + operator + " ")
+            if at >= 0:
+                left = self.eval(body[:at])
+                right = self.eval(body[at + len(operator) + 2:])
+                if operator == "=":
+                    if left == right:
+                        return 1
+                    return 0
+                if operator == "<>":
+                    if left != right:
+                        return 1
+                    return 0
+                if operator == "<":
+                    if left < right:
+                        return 1
+                    return 0
+                if operator == ">":
+                    if left > right:
+                        return 1
+                    return 0
+                if operator == "<=":
+                    if left <= right:
+                        return 1
+                    return 0
+                if left >= right:
+                    return 1
+                return 0
+            i += 1
+        return self.eval(body)
+
+    # --- exports -----------------------------------------------------------
+
+    def record_names(self, args: str) -> void:
+        parts = string.split(args, ",")
+        i = 0
+        while i < i32(len(parts)):
+            name = self.strip_quotes(string.strip(parts[i]))
+            if len(name) > 0:
+                self.exports = self.exports + name + ";"
+            i += 1
+
+    def check_exports(self) -> void:
+        parts = string.split(self.exports, ";")
+        i = 0
+        while i < i32(len(parts)):
+            name = string.strip(parts[i])
+            if len(name) > 0:
+                if self.find_label(name) < 0:
+                    self.fail(f"exported symbol '{name}' is not defined")
+            i += 1
+
+    # --- files -------------------------------------------------------------
+
+    def include_file(self, args: str) -> void:
+        path = self.strip_quotes(args)
+        if len(path) == 0:
+            self.fail(".include needs a file name")
+            return
+        text = fs.read_text(path)
+        if len(text) == 0:
+            self.fail(f"cannot read include file '{path}'")
+            return
+        lines = string.split(text, newline())
+        i = 0
+        while i < i32(len(lines)):
+            self.line(lines[i])
+            i += 1
+
+    def incbin_file(self, args: str) -> void:
+        path = self.strip_quotes(args)
+        if len(path) == 0:
+            self.fail(".incbin needs a file name")
+            return
+        text = fs.read_text(path)
+        if len(text) == 0:
+            self.fail(f"cannot read binary file '{path}'")
+            return
+        image = bytes.from_str(text)
+        i = 0
+        while i < i32(len(image)):
+            self.emit(bytes.get(image, i) as i64)
+            i += 1
+
+    # --- macros ------------------------------------------------------------
+    # Bodies are kept in one string as "name|params|body" entries separated by
+    # the unit separator, the same trick the label table uses.
+
+    def finish_macro(self) -> void:
+        if len(self.collecting) > 0:
+            self.macro_store = self.macro_store + self.collecting + "|" + self.collect_params + "|" + self.collect_body + unit()
+        self.collecting = ""
+        self.collect_params = ""
+        self.collect_body = ""
+
+    def macro_entry(self, name: str) -> i64:
+        if len(name) == 0:
+            return -1
+        needle = name + "|"
+        start = 0
+        while start < i32(len(self.macro_store)):
+            window = self.macro_store[start:]
+            found = string.find(window, needle)
+            if found < 0:
+                return -1
+            position = start + found
+            if position == 0 or self.macro_store[position - 1] == unit():
+                return position
+            start = position + 1
+        return -1
+
+    def macro_params(self, entry: i64) -> str:
+        first = string.find(self.macro_store[entry:], "|") + entry + 1
+        second = string.find(self.macro_store[first:], "|") + first
+        return self.macro_store[first:second]
+
+    def macro_body(self, entry: i64) -> str:
+        first = string.find(self.macro_store[entry:], "|") + entry + 1
+        second = string.find(self.macro_store[first:], "|") + first + 1
+        rest = self.macro_store[second:]
+        end = string.find(rest, unit())
+        if end >= 0:
+            return rest[:end]
+        return rest
+
+    # Substitutes the arguments and assembles the body. Returns False when the
+    # name is not a macro, so the caller can treat it as a mnemonic.
+    def expand_macro(self, name: str, args: str) -> bool:
+        entry = self.macro_entry(name)
+        if entry < 0:
+            return False
+        params = self.macro_params(entry)
+        body = self.macro_body(entry)
+        values = string.split(args, ",")
+        marker = bytes.to_str(bytes.from_hex("5C"))
+
+        names = string.split(params, ",")
+        i = 0
+        while i < i32(len(names)):
+            param = string.strip(names[i])
+            value = ""
+            if i < i32(len(values)):
+                value = string.strip(values[i])
+            if len(param) > 0:
+                body = string.replace(body, marker + str(i + 1), value)
+                body = string.replace(body, param, value)
+            i += 1
+
+        lines = string.split(body, newline())
+        j = 0
+        while j < i32(len(lines)):
+            self.line(lines[j])
+            j += 1
+        return True
+
+    # --- repeat blocks -----------------------------------------------------
+
+    def finish_repeat(self) -> void:
+        count = self.repeat_count
+        body = self.repeat_body
+        self.collecting_repeat = False
+        self.repeat_count = 0
+        self.repeat_body = ""
+        n = 0
+        while n < count:
+            lines = string.split(body, newline())
+            i = 0
+            while i < i32(len(lines)):
+                self.line(lines[i])
+                i += 1
+            n += 1
+
 
     # Pad to a multiple of `align` using subtraction only.
     def pad_to(self, align: i64) -> void:
@@ -547,11 +938,34 @@ class Assembler:
         parts = string.split(args, ",")
         i = 0
         while i < i32(len(parts)):
-            value = self.eval(parts[i])
-            if width == 1:
-                self.emit(value)
+            part = string.strip(parts[i])
+            if len(part) > 0 and part[0] == self.quote():
+                self.emit_string_literal(part)
             else:
-                self.emit_word(value)
+                value = self.eval(part)
+                if width == 1:
+                    self.emit(value)
+                elif width == 2:
+                    self.emit_word(value)
+                else:
+                    self.emit((value >> 8) & 0xFF)
+                    self.emit(value & 0xFF)
+            i += 1
+
+    def emit_string_literal(self, part: str) -> void:
+        mark = self.quote()
+        start = string.find(part, mark)
+        if start < 0:
+            self.fail("unterminated string")
+            return
+        end = string.find(part[start + 1:], mark)
+        if end < 0:
+            self.fail("unterminated string")
+            return
+        body = part[start + 1:start + 1 + end]
+        i = 0
+        while i < i32(len(body)):
+            self.emit(self.char_code(body[i]))
             i += 1
 
     def emit_text(self, args: str) -> void:
@@ -576,6 +990,11 @@ class Assembler:
     def instruction(self, mnemonic: str, operand: str) -> void:
         name = string.upper(string.strip(mnemonic))
         if len(name) == 0:
+            return
+        # Macro invocations expand textually before mnemonics are decoded.
+        if self.expand_macro(string.strip(mnemonic), operand):
+            return
+        if self.expand_macro(name, operand):
             return
         mode = self.classify(name, operand)
         opcode = OPS.get(name + ":" + mode)
@@ -669,6 +1088,7 @@ class Assembler:
 def assemble(source: str, origin: i64) -> Program:
     tool = Assembler(origin)
     tool.run(source)
+    tool.check_exports()
     size = tool.highest - origin
     if size < 0:
         size = 0

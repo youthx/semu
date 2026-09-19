@@ -85,6 +85,7 @@ libs/processor.sere instruction table and opcode handlers
 libs/native/        SDL3 debugger and persistent storage backend
 assets/             SVG source plus PNG, ICO, and runtime bitmap assets
 main.s              6502 Snake demo
+kernel.s            6502 kernel skeleton with text, keyboard, disk, and IRQ entry points
 ```
 
 The Windows application icon and the SDL window icon use the SEMU artwork in

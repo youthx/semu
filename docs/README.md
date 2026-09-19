@@ -26,6 +26,7 @@ an assembly program for the emulator.
 | SDL and storage backend | [`libs/native/native.cpp`](../libs/native/native.cpp) |
 | Sere/native declarations | [`libs/graphics.sere`](../libs/graphics.sere) |
 | Example 6502 program | [`main.s`](../main.s) |
+| Kernel example | [`kernel.s`](../kernel.s) |
 
 ## One important distinction
 

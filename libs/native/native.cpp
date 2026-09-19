@@ -10,6 +10,8 @@
 // Minimal Win32 declarations for loading SDL3.dll, instead of <windows.h>.
 extern "C" __declspec(dllimport) void* __stdcall LoadLibraryA(const char* file_name);
 extern "C" __declspec(dllimport) void* __stdcall GetProcAddress(void* module, const char* name);
+extern "C" __declspec(dllimport) uint32_t __stdcall GetModuleFileNameA(void* module, char* path,
+                                                                         uint32_t size);
 // Declare memcpy without pulling in <string.h>.
 extern "C" void* memcpy(void* dst, const void* src, size_t n);
 extern "C" __declspec(dllimport) void* __stdcall CreateFileA(const char* name, uint32_t access,
@@ -33,6 +35,7 @@ static const uint32_t SEMU_FILE_SHARE_READ = 0x00000001u;
 static const uint32_t SEMU_FILE_SHARE_WRITE = 0x00000002u;
 static const uint32_t SEMU_OPEN_EXISTING = 3u;
 static const uint32_t SEMU_OPEN_ALWAYS = 4u;
+static const uint32_t SEMU_FILE_ATTRIBUTE_NORMAL = 0x00000080u;
 static const uint32_t SEMU_FILE_BEGIN = 0u;
 static void* const SEMU_INVALID_HANDLE = (void*)(intptr_t)-1;
 
@@ -160,6 +163,28 @@ static int32_t storage_status = 0x01;
 static int32_t storage_command = 0;
 static int64_t storage_busy_cycles = 0;
 static bool storage_initialized = false;
+static char storage_path_buffer[512];
+
+static const char* storage_path(const char* name) {
+  char executable[512];
+  const uint32_t length = GetModuleFileNameA(nullptr, executable, sizeof(executable));
+  int32_t directory_end = (int32_t)length;
+  while (directory_end > 0 && executable[directory_end - 1] != '\\' && executable[directory_end - 1] != '/') {
+    directory_end--;
+  }
+  if (directory_end <= 0) directory_end = 0;
+  int32_t out = 0;
+  while (out < directory_end && out < (int32_t)sizeof(storage_path_buffer) - 1) {
+    storage_path_buffer[out] = executable[out];
+    out++;
+  }
+  int32_t name_index = 0;
+  while (name[name_index] != '\0' && out < (int32_t)sizeof(storage_path_buffer) - 1) {
+    storage_path_buffer[out++] = name[name_index++];
+  }
+  storage_path_buffer[out] = '\0';
+  return storage_path_buffer;
+}
 
 static bool storage_read_file(const char* path, uint8_t* buffer, uint32_t size) {
   void* handle = CreateFileA(path, SEMU_GENERIC_READ, SEMU_FILE_SHARE_READ | SEMU_FILE_SHARE_WRITE,
@@ -172,8 +197,8 @@ static bool storage_read_file(const char* path, uint8_t* buffer, uint32_t size) 
 }
 
 static bool storage_write_file(const char* path, const uint8_t* buffer, uint32_t size) {
-  void* handle = CreateFileA(path, SEMU_GENERIC_WRITE, SEMU_FILE_SHARE_READ,
-                             nullptr, SEMU_OPEN_ALWAYS, 0, nullptr);
+  void* handle = CreateFileA(path, SEMU_GENERIC_WRITE, SEMU_FILE_SHARE_READ | SEMU_FILE_SHARE_WRITE,
+                             nullptr, SEMU_OPEN_ALWAYS, SEMU_FILE_ATTRIBUTE_NORMAL, nullptr);
   if (handle == SEMU_INVALID_HANDLE) return false;
   int32_t high = 0;
   SetFilePointer(handle, 0, &high, SEMU_FILE_BEGIN);
@@ -193,11 +218,17 @@ static void storage_finish_command(void) {
     storage_status = 0x01;
   } else if (storage_command == 0x02) {
     memcpy(&storage_disk[block_id * DISK_BLOCK_SIZE], storage_block, DISK_BLOCK_SIZE);
-    storage_write_file("semu.disk", storage_disk, sizeof(storage_disk));
+    storage_write_file(storage_path("semu.disk"), storage_disk, sizeof(storage_disk));
     storage_status = 0x01;
   } else if (storage_command == 0x03) {
-    storage_write_file("semu.sram", storage_sram, sizeof(storage_sram));
-    storage_write_file("semu.disk", storage_disk, sizeof(storage_disk));
+    storage_write_file(storage_path("semu.sram"), storage_sram, sizeof(storage_sram));
+    storage_write_file(storage_path("semu.chr"), storage_chr, sizeof(storage_chr));
+    storage_write_file(storage_path("semu.disk"), storage_disk, sizeof(storage_disk));
+    storage_status = 0x01;
+  } else if (storage_command == 0x04) {
+    storage_block[0] = 0xA5;
+    storage_block[1] = 0x01;
+    storage_block[2] = 0x00;
     storage_status = 0x01;
   } else {
     storage_status = 0x80;
@@ -213,16 +244,17 @@ extern "C" void semu_storage_init(void) {
     storage_chr[i] = 0x00;
   }
   for (int32_t i = 0; i < DISK_BLOCK_SIZE * DISK_BLOCK_COUNT; ++i) storage_disk[i] = 0;
-  storage_read_file("semu.sram", storage_sram, sizeof(storage_sram));
-  storage_read_file("semu.prg", storage_prg, sizeof(storage_prg));
-  storage_read_file("semu.chr", storage_chr, sizeof(storage_chr));
-  storage_read_file("semu.disk", storage_disk, sizeof(storage_disk));
+  storage_read_file(storage_path("semu.sram"), storage_sram, sizeof(storage_sram));
+  storage_read_file(storage_path("semu.prg"), storage_prg, sizeof(storage_prg));
+  storage_read_file(storage_path("semu.chr"), storage_chr, sizeof(storage_chr));
+  storage_read_file(storage_path("semu.disk"), storage_disk, sizeof(storage_disk));
 }
 
 extern "C" void semu_storage_flush(void) {
   semu_storage_init();
-  storage_write_file("semu.sram", storage_sram, sizeof(storage_sram));
-  storage_write_file("semu.disk", storage_disk, sizeof(storage_disk));
+  storage_write_file(storage_path("semu.sram"), storage_sram, sizeof(storage_sram));
+  storage_write_file(storage_path("semu.chr"), storage_chr, sizeof(storage_chr));
+  storage_write_file(storage_path("semu.disk"), storage_disk, sizeof(storage_disk));
 }
 
 extern "C" int64_t semu_storage_read(int64_t address) {
@@ -252,6 +284,7 @@ extern "C" int64_t semu_storage_write(int64_t address, int64_t value) {
   const uint8_t v = (uint8_t)(value & 0xFF);
   if (a >= 0xA000 && a <= 0xBFFF) {
     storage_sram[a - 0xA000] = v;
+    storage_write_file(storage_path("semu.sram"), storage_sram, sizeof(storage_sram));
     return 1;
   }
   if (a == 0x5D00) { storage_prg_bank = v % BANK_COUNT; return 1; }
@@ -743,11 +776,18 @@ extern "C" void semu_gfx_shutdown(void) {
   sdl_Quit();
 }
 
+static void storage_copy_packed8(uint8_t* destination, int64_t packed) {
+  const uint64_t bits = (uint64_t)packed;
+  for (int32_t i = 0; i < 8; ++i) {
+    destination[i] = (uint8_t)((bits >> (i * 8)) & 0xFFu);
+  }
+}
+
 // Stores eight consecutive framebuffer pixels packed little-endian.
 extern "C" void semu_gfx_blit(int64_t index, int64_t packed) {
   const int64_t base = index * 8;
   if (base < 0 || base + 8 > (int64_t)screen_bytes) return;
-  memcpy(&screen_pixels[base], &packed, 8);
+  storage_copy_packed8(&screen_pixels[base], packed);
   screen_dirty = true;
 }
 
@@ -757,14 +797,14 @@ extern "C" void semu_gfx_blit64(int64_t index, int64_t p0, int64_t p1, int64_t p
   const int64_t base = index * 64;
   if (base < 0 || base + 64 > (int64_t)screen_bytes) return;
   uint8_t* dst = &screen_pixels[base];
-  memcpy(dst +  0, &p0, 8);
-  memcpy(dst +  8, &p1, 8);
-  memcpy(dst + 16, &p2, 8);
-  memcpy(dst + 24, &p3, 8);
-  memcpy(dst + 32, &p4, 8);
-  memcpy(dst + 40, &p5, 8);
-  memcpy(dst + 48, &p6, 8);
-  memcpy(dst + 56, &p7, 8);
+  storage_copy_packed8(dst +  0, p0);
+  storage_copy_packed8(dst +  8, p1);
+  storage_copy_packed8(dst + 16, p2);
+  storage_copy_packed8(dst + 24, p3);
+  storage_copy_packed8(dst + 32, p4);
+  storage_copy_packed8(dst + 40, p5);
+  storage_copy_packed8(dst + 48, p6);
+  storage_copy_packed8(dst + 56, p7);
   screen_dirty = true;
 }
 

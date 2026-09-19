@@ -91,6 +91,15 @@ DELAY_IN    = $C8                      ; 200 *    5 cycles
 ;  entry point -- execution starts at the first byte of the image ($1000)
 ; =========================================================================
 start:
+        LDA #$42
+        STA $A000
+        LDA #$00
+        STA $5E02
+        STA $5E03
+        STA $5E04
+        LDA #$01
+        STA $5E00
+
         JSR clear_screen
         JSR init_game
         JSR wait                       ; a beat of grace before the first move

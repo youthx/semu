@@ -1,18 +1,4 @@
 // SDL3 bindings and a small debugger window for semu.
-//
-// SDL3 is pulled out of SDL3.dll at runtime (LoadLibraryA + GetProcAddress), so
-// the Sere executable never links an SDL3 import library: the MSYS2 build only
-// ships MinGW import libraries, which do not mix with the MSVC/LLVM link Sere
-// performs, and the debug CRT is not installed either.
-//
-// The plain `extern "C"` symbols below are what libs/graphics.sere binds
-// against. sere_mod_init additionally registers boxed wrappers with the Sere
-// runtime, so the same entry points are reachable from native callbacks.
-//
-// Only the Sere module API and SDL3 headers are included: <windows.h> and the
-// CRT headers it drags in make the Debug build reference MSVCRTD.lib, which the
-// Sere link step does not have. For the same reason the debug-only runtime
-// checks are disabled and the debug CRT default library is dropped here.
 
 #pragma runtime_checks("", off)
 #pragma comment(linker, "/NODEFAULTLIB:MSVCRTD")
@@ -24,6 +10,8 @@
 // Minimal Win32 declarations for loading SDL3.dll, instead of <windows.h>.
 extern "C" __declspec(dllimport) void* __stdcall LoadLibraryA(const char* file_name);
 extern "C" __declspec(dllimport) void* __stdcall GetProcAddress(void* module, const char* name);
+// Declare memcpy without pulling in <string.h>.
+extern "C" void* memcpy(void* dst, const void* src, size_t n);
 
 // SDL3 entry points declared in SDL_test_font.h and SDL_timer.h, which are not
 // worth including here because they pull in more CRT headers.
@@ -54,6 +42,7 @@ static decltype(&SDL_DestroyTexture) sdl_DestroyTexture;
 static decltype(&SDL_PollEvent) sdl_PollEvent;
 static decltype(&SDL_ConvertEventToRenderCoordinates) sdl_ConvertEventToRenderCoordinates;
 static decltype(&SDL_GetKeyboardState) sdl_GetKeyboardState;
+static decltype(&SDL_SetWindowSize) sdl_SetWindowSize;
 
 static bool load_sdl3(void) {
   void* library = LoadLibraryA("SDL3.dll");
@@ -98,6 +87,7 @@ static bool load_sdl3(void) {
   SEMU_LOAD(PollEvent)
   SEMU_LOAD(GetKeyboardState)
   SEMU_LOAD(ConvertEventToRenderCoordinates)
+  SEMU_LOAD(SetWindowSize)
 
 #undef SEMU_LOAD
   return true;
@@ -142,8 +132,12 @@ static bool screen_dirty = false;
 // debugger shortcuts stay out of the way.
 static bool screen_focus = false;
 
-// Debug display tab: 0 = CPU state, 1 = Memory viewer
+// Layout: 0 = tabbed (CPU/MEM tabs, left panel + screen), 1 = split (MEM left, screen centre, CPU right)
+static int32_t layout = 0;
+// Debug display tab used only in layout 0: 0 = CPU, 1 = Memory
 static int32_t debug_tab = 0;
+// Current panel draw x-offset; set before each draw call so helpers use it.
+static float g_panel_offset = 6.0f;  // MARGIN value; updated at runtime
 // Memory viewer parameters
 static int64_t mem_view_start = 0x0000;
 static int64_t mem_view_count = 128;
@@ -157,10 +151,8 @@ static const float UI_SCALE = 2.0f;
 static const float MARGIN = 6.0f;
 static const float PANEL_W = 168.0f;
 static const float LINE_H = 10.0f;
-static const float TAB_H = 14.0f;  // tab bar height
+static const float TAB_H = 14.0f;
 static const float BUTTON_H = 20.0f;
-static const float BUTTON_Y = 180.0f;
-static const float HINT_Y = 206.0f;
 
 static const uint32_t COLOR_BG = 0x0E1116;
 static const uint32_t COLOR_PANEL = 0x171B23;
@@ -172,11 +164,18 @@ static const uint32_t COLOR_GOOD = 0x7BD88F;
 static const uint32_t COLOR_WARN = 0xFFD866;
 static const uint32_t COLOR_BAD = 0xFF6B6B;
 
-static float panel_x(void) { return MARGIN; }
-static float panel_y(void) { return MARGIN + TAB_H; }  // content starts below tabs
-static float screen_x(void) { return MARGIN + PANEL_W + MARGIN; }
-static float screen_y(void) { return MARGIN; }
-static float panel_h(void) { return (float)screen_h * screen_zoom; }
+static float panel_x(void)   { return g_panel_offset; }
+static float panel_y(void)   { return MARGIN + TAB_H; }
+static float panel_h(void)   { return (float)screen_h * screen_zoom + MARGIN - TAB_H; }
+static float button_y(void)  { return panel_y() + panel_h() - 50.0f; }
+static float hint_y(void)    { return panel_y() + panel_h() - 24.0f; }
+// In split layout: MEM(left) | screen(centre) | CPU(right)
+static float screen_x(void)  { return layout == 0 ? MARGIN + PANEL_W + MARGIN
+                                                   : MARGIN + PANEL_W + MARGIN; }
+static float screen_y(void)  { return MARGIN; }
+static float right_panel_x(void) { return MARGIN + PANEL_W + MARGIN + (float)screen_w * screen_zoom + MARGIN; }
+static float base_window_w(void) { return MARGIN + PANEL_W + MARGIN + (float)screen_w * screen_zoom + MARGIN; }
+static float split_window_w(void){ return MARGIN + PANEL_W + MARGIN + (float)screen_w * screen_zoom + MARGIN + PANEL_W + MARGIN; }
 
 // --- small drawing helpers -------------------------------------------------
 
@@ -190,10 +189,17 @@ struct Button {
 };
 
 static Button buttons[3] = {
-    {0.0f, BUTTON_Y, 76.0f, BUTTON_H, "RUN", ACTION_TOGGLE_RUN},
-    {0.0f, BUTTON_Y, 40.0f, BUTTON_H, "STEP", ACTION_STEP},
-    {0.0f, BUTTON_Y, 44.0f, BUTTON_H, "RESET", ACTION_RESET},
+    {0.0f, 0.0f, 76.0f, BUTTON_H, "RUN", ACTION_TOGGLE_RUN},
+    {0.0f, 0.0f, 40.0f, BUTTON_H, "STEP", ACTION_STEP},
+    {0.0f, 0.0f, 44.0f, BUTTON_H, "RESET", ACTION_RESET},
 };
+
+static void update_buttons(void) {
+  const float by = button_y();
+  buttons[0].x = panel_x();                          buttons[0].y = by;
+  buttons[1].x = panel_x() + buttons[0].w + 4.0f;   buttons[1].y = by;
+  buttons[2].x = panel_x() + PANEL_W - buttons[2].w; buttons[2].y = by;
+}
 
 static void set_color(uint32_t rgb) {
   sdl_SetRenderDrawColor(renderer, (uint8_t)((rgb >> 16) & 0xFF), (uint8_t)((rgb >> 8) & 0xFF),
@@ -335,8 +341,23 @@ static void update_fps(void) {
 
 // --- Memory viewer panel ---------------------------------------------------
 
-// Draws the two tab buttons at the very top of the panel.
+// Tab bar for layout 0, or a static header bar for layout 1.
+static void draw_header_bar(float px, const char* label, bool active) {
+  const float ty = MARGIN;
+  fill_rect(px, ty, PANEL_W, TAB_H, active ? COLOR_ACCENT : COLOR_PANEL);
+  fill_rect(px, ty, PANEL_W, 1.0f, COLOR_BORDER);
+  fill_rect(px, ty, 1.0f, TAB_H, COLOR_BORDER);
+  fill_rect(px + PANEL_W - 1.0f, ty, 1.0f, TAB_H, COLOR_BORDER);
+  fill_rect(px, ty + TAB_H - 1.0f, PANEL_W, 1.0f, active ? COLOR_ACCENT : COLOR_BORDER);
+  draw_text(label, px + 6.0f, ty + 3.0f, active ? COLOR_BG : COLOR_TEXT);
+  // Layout toggle hint on the right
+  const char* hint = layout == 0 ? "L:SPLIT" : "L:TABBED";
+  const float hw = (float)(text_len(hint) * 8);
+  draw_text(hint, px + PANEL_W - hw - 6.0f, ty + 3.0f, active ? COLOR_BG : COLOR_DIM);
+}
+
 static void draw_tabs(void) {
+  if (layout == 1) return;  // split layout draws individual headers per panel
   const float tab_w = PANEL_W / 2.0f;
   const float ty = MARGIN;
   // CPU tab
@@ -361,22 +382,18 @@ static void draw_tabs(void) {
 // Format: "XXXX: AA BB CC DD" = 18 chars -- exactly fits with 6px margin each side.
 static void draw_memory_viewer(void) {
   fill_rect(panel_x(), panel_y(), PANEL_W, panel_h(), COLOR_PANEL);
-  fill_rect(panel_x(), panel_y(), PANEL_W, 1.0f, COLOR_BORDER);
   fill_rect(panel_x(), panel_y() + panel_h() - 1.0f, PANEL_W, 1.0f, COLOR_BORDER);
   fill_rect(panel_x(), panel_y(), 1.0f, panel_h(), COLOR_BORDER);
   fill_rect(panel_x() + PANEL_W - 1.0f, panel_y(), 1.0f, panel_h(), COLOR_BORDER);
 
-  // Header: "MEMORY" left, start address right
+  // Show start address in top-right
   char addr_label[8];
   int32_t alp = 0;
   write_hex(addr_label, alp, mem_view_start, 4);
   addr_label[alp] = '\0';
-  draw_text("MEMORY", panel_x() + 6.0f, panel_y() + 6.0f, COLOR_ACCENT);
-  draw_text(addr_label, panel_x() + PANEL_W - 6.0f - (float)(alp * 8), panel_y() + 6.0f, COLOR_DIM);
+  draw_text(addr_label, panel_x() + PANEL_W - 6.0f - (float)(alp * 8), panel_y() + 4.0f, COLOR_DIM);
 
-  float row = panel_y() + 18.0f;
-  fill_rect(panel_x() + 6.0f, row, PANEL_W - 12.0f, 1.0f, COLOR_BORDER);
-  row += 4.0f;
+  float row = panel_y() + 4.0f;
 
   // 4 bytes per row: "XXXX: AA BB CC DD"
   const float max_row = panel_y() + panel_h() - 14.0f;
@@ -396,7 +413,7 @@ static void draw_memory_viewer(void) {
   }
 
   fill_rect(panel_x() + 6.0f, max_row - 2.0f, PANEL_W - 12.0f, 1.0f, COLOR_BORDER);
-  draw_text("M: CPU view", panel_x() + 6.0f, max_row, COLOR_DIM);
+  draw_text("M: toggle tab  L: layout", panel_x() + 6.0f, max_row, COLOR_DIM);
 }
 
 // --- CPU state panel -------------------------------------------------------
@@ -404,15 +421,11 @@ static void draw_memory_viewer(void) {
 static void draw_panel(int64_t a, int64_t x, int64_t y, int64_t sp, int64_t pc, int64_t p,
                        int64_t cycles, int64_t speed, int64_t state) {
   fill_rect(panel_x(), panel_y(), PANEL_W, panel_h(), COLOR_PANEL);
-  fill_rect(panel_x(), panel_y(), PANEL_W, 1.0f, COLOR_BORDER);
   fill_rect(panel_x(), panel_y() + panel_h() - 1.0f, PANEL_W, 1.0f, COLOR_BORDER);
   fill_rect(panel_x(), panel_y(), 1.0f, panel_h(), COLOR_BORDER);
   fill_rect(panel_x() + PANEL_W - 1.0f, panel_y(), 1.0f, panel_h(), COLOR_BORDER);
 
-  draw_text("SEMU", panel_x() + 6.0f, panel_y() + 6.0f, COLOR_ACCENT);
-  draw_text("6502 DEBUGGER", panel_x() + 6.0f, panel_y() + 6.0f + LINE_H, COLOR_DIM);
-
-  float row = panel_y() + 32.0f;
+  float row = panel_y() + 4.0f;
 
   draw_field(row, "A", (uint64_t)(a & 0xFF), 2, true);
   row += LINE_H;
@@ -460,17 +473,12 @@ static void draw_panel(int64_t a, int64_t x, int64_t y, int64_t sp, int64_t pc, 
   draw_button(buttons[1], "STEP", false);
   draw_button(buttons[2], "RESET", false);
 
-  const uint32_t hint = screen_focus ? COLOR_BORDER : COLOR_DIM;
+  const float hy = hint_y();
+  const uint32_t hint_col = screen_focus ? COLOR_BORDER : COLOR_DIM;
   if (screen_focus) {
-    draw_text("KEYS GO TO CPU", panel_x() + 6.0f, HINT_Y, COLOR_ACCENT);
-    draw_text("ESC OR CLICK ON", panel_x() + 6.0f, HINT_Y + 10.0f, hint);
-    draw_text("THE SCREEN TO", panel_x() + 6.0f, HINT_Y + 20.0f, hint);
-    draw_text("RELEASE FOCUS", panel_x() + 6.0f, HINT_Y + 30.0f, hint);
+    draw_text("ESC: release focus", panel_x() + 6.0f, hy, COLOR_ACCENT);
   } else {
-    draw_text("SPACE RUN/PAUSE", panel_x() + 6.0f, HINT_Y, hint);
-    draw_text("S STEP   R RESET", panel_x() + 6.0f, HINT_Y + 10.0f, hint);
-    draw_text("UP/DOWN SPEED", panel_x() + 6.0f, HINT_Y + 20.0f, hint);
-    draw_text("F FOCUS SCREEN", panel_x() + 6.0f, HINT_Y + 30.0f, hint);
+    draw_text("SPC:run S:step L:layout", panel_x() + 6.0f, hy, hint_col);
   }
 }
 
@@ -522,7 +530,7 @@ extern "C" int64_t semu_gfx_init(int64_t width, int64_t height, int64_t zoom) {
     return 0;
   }
 
-  const float window_w = MARGIN + PANEL_W + MARGIN + (float)screen_w * screen_zoom + MARGIN;
+  const float window_w = base_window_w();
   const float window_h = MARGIN + (float)screen_h * screen_zoom + MARGIN;
 
   window = sdl_CreateWindow("semu - 6502", (int32_t)(window_w * UI_SCALE),
@@ -546,9 +554,8 @@ extern "C" int64_t semu_gfx_init(int64_t width, int64_t height, int64_t zoom) {
     return 0;
   }
 
-  buttons[0].x = panel_x();
-  buttons[1].x = panel_x() + buttons[0].w + 4.0f;
-  buttons[2].x = panel_x() + PANEL_W - buttons[2].w;
+  g_panel_offset = MARGIN;
+  update_buttons();
 
   fps_since = sdl_GetTicks();
   return 1;
@@ -570,18 +577,28 @@ extern "C" void semu_gfx_shutdown(void) {
   sdl_Quit();
 }
 
-// Stores eight consecutive framebuffer pixels packed little endian in `packed`.
+// Stores eight consecutive framebuffer pixels packed little-endian.
 extern "C" void semu_gfx_blit(int64_t index, int64_t packed) {
-  if (screen_w == 0) {
-    return;
-  }
   const int64_t base = index * 8;
-  if (base < 0 || base + 8 > (int64_t)screen_bytes) {
-    return;
-  }
-  for (int32_t i = 0; i < 8; ++i) {
-    screen_pixels[base + i] = (uint8_t)((packed >> (8 * i)) & 0xFF);
-  }
+  if (base < 0 || base + 8 > (int64_t)screen_bytes) return;
+  memcpy(&screen_pixels[base], &packed, 8);
+  screen_dirty = true;
+}
+
+// Stores 64 consecutive pixels (8 packed i64s) in one call — 8× fewer cross-language calls.
+extern "C" void semu_gfx_blit64(int64_t index, int64_t p0, int64_t p1, int64_t p2, int64_t p3,
+                                  int64_t p4, int64_t p5, int64_t p6, int64_t p7) {
+  const int64_t base = index * 64;
+  if (base < 0 || base + 64 > (int64_t)screen_bytes) return;
+  uint8_t* dst = &screen_pixels[base];
+  memcpy(dst +  0, &p0, 8);
+  memcpy(dst +  8, &p1, 8);
+  memcpy(dst + 16, &p2, 8);
+  memcpy(dst + 24, &p3, 8);
+  memcpy(dst + 32, &p4, 8);
+  memcpy(dst + 40, &p5, 8);
+  memcpy(dst + 48, &p6, 8);
+  memcpy(dst + 56, &p7, 8);
   screen_dirty = true;
 }
 
@@ -636,8 +653,15 @@ extern "C" int64_t semu_gfx_poll(void) {
           action = ACTION_SLOWER;
           break;
         case SDL_SCANCODE_M:
-          debug_tab = (debug_tab + 1) % 2;  // Toggle between CPU (0) and Memory (1)
+          if (layout == 0) debug_tab = (debug_tab + 1) % 2;
           break;
+        case SDL_SCANCODE_L: {
+          layout = 1 - layout;
+          const float new_w = (layout == 0) ? base_window_w() : split_window_w();
+          const float new_h = MARGIN + (float)screen_h * screen_zoom + MARGIN;
+          sdl_SetWindowSize(window, (int32_t)(new_w * UI_SCALE), (int32_t)(new_h * UI_SCALE));
+          break;
+        }
         default:
           break;
       }
@@ -646,16 +670,19 @@ extern "C" int64_t semu_gfx_poll(void) {
       if (inside_screen(event.button.x, event.button.y)) {
         screen_focus = !screen_focus;
       } else if (!screen_focus) {
-        // Tab bar click
-        const float tab_w = PANEL_W / 2.0f;
         const float ty = MARGIN;
-        if (event.button.y >= ty && event.button.y < ty + TAB_H) {
-          if (event.button.x >= panel_x() && event.button.x < panel_x() + tab_w) {
-            debug_tab = 0;
-          } else if (event.button.x >= panel_x() + tab_w && event.button.x < panel_x() + PANEL_W) {
-            debug_tab = 1;
+        if (layout == 0) {
+          // Tab bar click in tabbed layout
+          const float tab_w = PANEL_W / 2.0f;
+          if (event.button.y >= ty && event.button.y < ty + TAB_H) {
+            if (event.button.x >= MARGIN && event.button.x < MARGIN + tab_w) {
+              debug_tab = 0;
+            } else if (event.button.x >= MARGIN + tab_w && event.button.x < MARGIN + PANEL_W) {
+              debug_tab = 1;
+            }
           }
         }
+        // RUN/STEP/RESET buttons (always in the CPU panel)
         for (int32_t i = 0; i < 3; ++i) {
           if (button_hit(buttons[i], event.button.x, event.button.y)) {
             action = buttons[i].action;
@@ -683,11 +710,26 @@ extern "C" void semu_gfx_frame(int64_t a, int64_t x, int64_t y, int64_t sp, int6
   set_color(COLOR_BG);
   sdl_RenderClear(renderer);
 
-  draw_tabs();
-  if (debug_tab == 0) {
-    draw_panel(a, x, y, sp, pc, p, cycles, speed, state);
+  if (layout == 0) {
+    // Tabbed: single left panel showing CPU or MEM
+    g_panel_offset = MARGIN;
+    update_buttons();
+    draw_tabs();
+    if (debug_tab == 0) {
+      draw_panel(a, x, y, sp, pc, p, cycles, speed, state);
+    } else {
+      draw_memory_viewer();
+    }
   } else {
+    // Split: MEM on left, CPU on right
+    g_panel_offset = MARGIN;
+    draw_header_bar(g_panel_offset, "MEM", false);
     draw_memory_viewer();
+    g_panel_offset = right_panel_x();
+    update_buttons();
+    draw_header_bar(g_panel_offset, "CPU", true);
+    draw_panel(a, x, y, sp, pc, p, cycles, speed, state);
+    g_panel_offset = MARGIN;  // restore
   }
   draw_screen();
 
@@ -743,17 +785,16 @@ extern "C" void semu_gfx_set_debug_tab(int64_t tab) {
   debug_tab = tab ? 1 : 0;
 }
 
-// Update memory viewer buffer with bytes (8 bytes at a time, little-endian packed).
+// 1 = memory view is currently visible; Sere uses this to skip blit_memory when not needed.
+extern "C" int64_t semu_gfx_mem_visible(void) {
+  return (layout == 1 || debug_tab == 1) ? 1 : 0;
+}
+
 extern "C" void semu_gfx_blit_memory(int64_t index, int64_t packed) {
-  const uint8_t* src = (const uint8_t*)&packed;
   int32_t pos = (int32_t)index * 8;
   if (pos + 8 <= 256) {
-    for (int32_t i = 0; i < 8; i++) {
-      mem_view_buffer[pos + i] = src[i];
-    }
-    if (pos + 8 > mem_view_buffer_size) {
-      mem_view_buffer_size = pos + 8;
-    }
+    memcpy(&mem_view_buffer[pos], &packed, 8);
+    if (pos + 8 > (int32_t)mem_view_buffer_size) mem_view_buffer_size = pos + 8;
   }
 }
 
@@ -789,6 +830,36 @@ static Sere_Object* boxed_blit(Sere_Object* const* args, int32_t nargs) {
   return Sere_None_New();
 }
 
+static Sere_Object* boxed_blit64(Sere_Object* const* args, int32_t nargs) {
+  semu_gfx_blit64(arg_i64(args, nargs, 0, 0), arg_i64(args, nargs, 1, 0), arg_i64(args, nargs, 2, 0),
+                  arg_i64(args, nargs, 3, 0), arg_i64(args, nargs, 4, 0), arg_i64(args, nargs, 5, 0),
+                  arg_i64(args, nargs, 6, 0), arg_i64(args, nargs, 7, 0), arg_i64(args, nargs, 8, 0));
+  return Sere_None_New();
+}
+
+static Sere_Object* boxed_blit_memory(Sere_Object* const* args, int32_t nargs) {
+  semu_gfx_blit_memory(arg_i64(args, nargs, 0, 0), arg_i64(args, nargs, 1, 0));
+  return Sere_None_New();
+}
+
+static Sere_Object* boxed_mem_visible(Sere_Object* const* args, int32_t nargs) {
+  return Sere_Long_FromI64(semu_gfx_mem_visible());
+}
+
+static Sere_Object* boxed_get_debug_tab(Sere_Object* const* args, int32_t nargs) {
+  return Sere_Long_FromI64(semu_gfx_get_debug_tab());
+}
+
+static Sere_Object* boxed_set_debug_tab(Sere_Object* const* args, int32_t nargs) {
+  semu_gfx_set_debug_tab(arg_i64(args, nargs, 0, 0));
+  return Sere_None_New();
+}
+
+static Sere_Object* boxed_set_memory_view(Sere_Object* const* args, int32_t nargs) {
+  semu_gfx_set_memory_view(arg_i64(args, nargs, 0, 0), arg_i64(args, nargs, 1, 0));
+  return Sere_None_New();
+}
+
 static Sere_Object* boxed_frame(Sere_Object* const* args, int32_t nargs) {
   semu_gfx_frame(arg_i64(args, nargs, 0, 0), arg_i64(args, nargs, 1, 0), arg_i64(args, nargs, 2, 0),
                  arg_i64(args, nargs, 3, 0), arg_i64(args, nargs, 4, 0), arg_i64(args, nargs, 5, 0),
@@ -802,5 +873,11 @@ extern "C" void sere_mod_init(void) {
   Sere_DefineFunction("semu_gfx_poll", boxed_poll, 0);
   Sere_DefineFunction("semu_input_state", boxed_input, 0);
   Sere_DefineFunction("semu_gfx_blit", boxed_blit, 2);
+  Sere_DefineFunction("semu_gfx_blit64", boxed_blit64, 9);
+  Sere_DefineFunction("semu_gfx_blit_memory", boxed_blit_memory, 2);
+  Sere_DefineFunction("semu_gfx_mem_visible", boxed_mem_visible, 0);
+  Sere_DefineFunction("semu_gfx_get_debug_tab", boxed_get_debug_tab, 0);
+  Sere_DefineFunction("semu_gfx_set_debug_tab", boxed_set_debug_tab, 1);
+  Sere_DefineFunction("semu_gfx_set_memory_view", boxed_set_memory_view, 2);
   Sere_DefineFunction("semu_gfx_frame", boxed_frame, 9);
 }

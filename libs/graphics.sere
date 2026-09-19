@@ -21,6 +21,14 @@ def gfx_poll() -> i64
 extern "C" "semu_gfx_blit"
 def gfx_blit(index: i64, packed: i64) -> void
 
+# Uploads 64 consecutive screen bytes in one call (8 packed i64s, index in units of 64 bytes).
+extern "C" "semu_gfx_blit64"
+def gfx_blit64(index: i64, p0: i64, p1: i64, p2: i64, p3: i64, p4: i64, p5: i64, p6: i64, p7: i64) -> void
+
+# Returns 1 if the memory viewer panel is currently visible.
+extern "C" "semu_gfx_mem_visible"
+def gfx_mem_visible() -> i64
+
 # Redraws the window with the current CPU state or memory viewer.
 extern "C" "semu_gfx_frame"
 def gfx_frame(a: i64, x: i64, y: i64, sp: i64, pc: i64, p: i64, cycles: i64, speed: i64, state: i64) -> void

@@ -1,4 +1,6 @@
-from vm import VM, FLAG_C, FLAG_D, FLAG_I, FLAG_N, FLAG_V, FLAG_Z
+import bytes
+
+from vm import VM, FLAG_B, FLAG_C, FLAG_D, FLAG_I, FLAG_N, FLAG_V, FLAG_Z
 
 # How an instruction locates its operand.
 enum InstMode:
@@ -184,7 +186,9 @@ def _pha(vm: Ptr[VM], address: i64, value: i64) -> void:
 
 
 def _php(vm: Ptr[VM], address: i64, value: i64) -> void:
-    (*vm).push((*vm).status())
+    # PHP pushes with B set, which is how software tells the two apart.
+    pushed = ((*vm).status() as i64) | FLAG_B
+    (*vm).push(pushed as byte)
 
 
 def _pla(vm: Ptr[VM], address: i64, value: i64) -> void:
@@ -450,6 +454,130 @@ def _nop(vm: Ptr[VM], address: i64, value: i64) -> void:
 
 def _hlt(vm: Ptr[VM], address: i64, value: i64) -> void:
     (*vm).halt()
+
+
+def _jam(vm: Ptr[VM], address: i64, value: i64) -> void:
+    # The KIL/JAM opcodes lock the CPU up, which from the outside looks halted.
+    (*vm).halt()
+
+
+# --- undocumented opcodes --------------------------------------------------
+# The NMOS combinations NES software actually uses. They are built from the
+# same primitives as the official handlers.
+
+def _lax(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).A = value & 0xFF
+    (*vm).X = (*vm).A
+    _set_zn(vm, (*vm).A)
+
+
+def _sax(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).write(address, ((*vm).A & (*vm).X) as byte)
+
+
+def _dcp(vm: Ptr[VM], address: i64, value: i64) -> void:
+    result = (value - 1) & 0xFF
+    (*vm).write(address, result as byte)
+    _compare(vm, (*vm).A, result)
+
+
+def _isc(vm: Ptr[VM], address: i64, value: i64) -> void:
+    result = (value + 1) & 0xFF
+    (*vm).write(address, result as byte)
+    _sbc(vm, address, result)
+
+
+def _slo(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).set_flag(FLAG_C, (value & 0x80) != 0)
+    result = (value << 1) & 0xFF
+    (*vm).write(address, result as byte)
+    (*vm).A = (*vm).A | result
+    _set_zn(vm, (*vm).A)
+
+
+def _rla(vm: Ptr[VM], address: i64, value: i64) -> void:
+    carry = _carry_in(vm)
+    (*vm).set_flag(FLAG_C, (value & 0x80) != 0)
+    result = ((value << 1) & 0xFF) | carry
+    (*vm).write(address, result as byte)
+    (*vm).A = (*vm).A & result
+    _set_zn(vm, (*vm).A)
+
+
+def _sre(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).set_flag(FLAG_C, (value & 0x01) != 0)
+    result = (value >> 1) & 0x7F
+    (*vm).write(address, result as byte)
+    (*vm).A = (*vm).A ^ result
+    _set_zn(vm, (*vm).A)
+
+
+def _rra(vm: Ptr[VM], address: i64, value: i64) -> void:
+    carry = _carry_in(vm)
+    (*vm).set_flag(FLAG_C, (value & 0x01) != 0)
+    result = ((value >> 1) & 0x7F) | (carry << 7)
+    (*vm).write(address, result as byte)
+    _adc(vm, address, result)
+
+
+def _anc(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).A = (*vm).A & (value & 0xFF)
+    _set_zn(vm, (*vm).A)
+    (*vm).set_flag(FLAG_C, ((*vm).A & 0x80) != 0)
+
+
+def _alr(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).A = (*vm).A & (value & 0xFF)
+    (*vm).set_flag(FLAG_C, ((*vm).A & 0x01) != 0)
+    (*vm).A = ((*vm).A >> 1) & 0x7F
+    _set_zn(vm, (*vm).A)
+
+
+def _arr(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).A = (*vm).A & (value & 0xFF)
+    carry = _carry_in(vm)
+    (*vm).A = ((*vm).A >> 1) | (carry << 7)
+    _set_zn(vm, (*vm).A)
+    (*vm).set_flag(FLAG_C, ((*vm).A & 0x40) != 0)
+    bit6 = ((*vm).A >> 6) & 1
+    bit5 = ((*vm).A >> 5) & 1
+    (*vm).set_flag(FLAG_V, bit6 != bit5)
+
+
+def _sbx(vm: Ptr[VM], address: i64, value: i64) -> void:
+    operand = value & 0xFF
+    combined = (*vm).A & (*vm).X
+    (*vm).set_flag(FLAG_C, combined >= operand)
+    result = (combined - operand) & 0xFF
+    (*vm).X = result
+    _set_zn(vm, result)
+
+
+def _las(vm: Ptr[VM], address: i64, value: i64) -> void:
+    result = value & (*vm).SP
+    (*vm).A = result
+    (*vm).X = result
+    (*vm).SP = result
+    _set_zn(vm, result)
+
+
+# The unstable stores really AND the register with the high byte of the address
+# plus one. Software relies on the register value, which is what is stored here.
+def _ahx(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).write(address, ((*vm).A & (*vm).X) as byte)
+
+
+def _shx(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).write(address, (*vm).X as byte)
+
+
+def _shy(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).write(address, (*vm).Y as byte)
+
+
+def _tas(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).SP = (*vm).A & (*vm).X
+    (*vm).write(address, (*vm).SP as byte)
 
 
 # --- addressing modes ------------------------------------------------------
@@ -725,7 +853,200 @@ const INST_MAP = {
     # system
     0xEA: Instruction("NOP", InstMode.Implied, 2, 0, _nop),
     0x02: Instruction("HLT", InstMode.Implied, 2, 0, _hlt),
+
+    # --- undocumented ---
+    # LAX
+    0xA7: Instruction("LAX", InstMode.ZeroPage, 3, 0, _lax),
+    0xB7: Instruction("LAX", InstMode.ZeroPageY, 4, 0, _lax),
+    0xAF: Instruction("LAX", InstMode.Absolute, 4, 0, _lax),
+    0xBF: Instruction("LAX", InstMode.AbsoluteY, 4, 1, _lax),
+    0xA3: Instruction("LAX", InstMode.IndirectX, 6, 0, _lax),
+    0xB3: Instruction("LAX", InstMode.IndirectY, 5, 1, _lax),
+
+    # SAX
+    0x87: Instruction("SAX", InstMode.ZeroPage, 3, 0, _sax),
+    0x97: Instruction("SAX", InstMode.ZeroPageY, 4, 0, _sax),
+    0x8F: Instruction("SAX", InstMode.Absolute, 4, 0, _sax),
+    0x83: Instruction("SAX", InstMode.IndirectX, 6, 0, _sax),
+
+    # DCP
+    0xC7: Instruction("DCP", InstMode.ZeroPage, 5, 0, _dcp),
+    0xD7: Instruction("DCP", InstMode.ZeroPageX, 6, 0, _dcp),
+    0xCF: Instruction("DCP", InstMode.Absolute, 6, 0, _dcp),
+    0xDF: Instruction("DCP", InstMode.AbsoluteX, 7, 0, _dcp),
+    0xDB: Instruction("DCP", InstMode.AbsoluteY, 7, 0, _dcp),
+    0xC3: Instruction("DCP", InstMode.IndirectX, 6, 0, _dcp),
+    0xD3: Instruction("DCP", InstMode.IndirectY, 5, 0, _dcp),
+
+    # ISC
+    0xE7: Instruction("ISC", InstMode.ZeroPage, 5, 0, _isc),
+    0xF7: Instruction("ISC", InstMode.ZeroPageX, 6, 0, _isc),
+    0xEF: Instruction("ISC", InstMode.Absolute, 6, 0, _isc),
+    0xFF: Instruction("ISC", InstMode.AbsoluteX, 7, 0, _isc),
+    0xFB: Instruction("ISC", InstMode.AbsoluteY, 7, 0, _isc),
+    0xE3: Instruction("ISC", InstMode.IndirectX, 6, 0, _isc),
+    0xF3: Instruction("ISC", InstMode.IndirectY, 5, 0, _isc),
+
+    # SLO
+    0x07: Instruction("SLO", InstMode.ZeroPage, 5, 0, _slo),
+    0x17: Instruction("SLO", InstMode.ZeroPageX, 6, 0, _slo),
+    0x0F: Instruction("SLO", InstMode.Absolute, 6, 0, _slo),
+    0x1F: Instruction("SLO", InstMode.AbsoluteX, 7, 0, _slo),
+    0x1B: Instruction("SLO", InstMode.AbsoluteY, 7, 0, _slo),
+    0x03: Instruction("SLO", InstMode.IndirectX, 6, 0, _slo),
+    0x13: Instruction("SLO", InstMode.IndirectY, 5, 0, _slo),
+
+    # RLA
+    0x27: Instruction("RLA", InstMode.ZeroPage, 5, 0, _rla),
+    0x37: Instruction("RLA", InstMode.ZeroPageX, 6, 0, _rla),
+    0x2F: Instruction("RLA", InstMode.Absolute, 6, 0, _rla),
+    0x3F: Instruction("RLA", InstMode.AbsoluteX, 7, 0, _rla),
+    0x3B: Instruction("RLA", InstMode.AbsoluteY, 7, 0, _rla),
+    0x23: Instruction("RLA", InstMode.IndirectX, 6, 0, _rla),
+    0x33: Instruction("RLA", InstMode.IndirectY, 5, 0, _rla),
+
+    # SRE
+    0x47: Instruction("SRE", InstMode.ZeroPage, 5, 0, _sre),
+    0x57: Instruction("SRE", InstMode.ZeroPageX, 6, 0, _sre),
+    0x4F: Instruction("SRE", InstMode.Absolute, 6, 0, _sre),
+    0x5F: Instruction("SRE", InstMode.AbsoluteX, 7, 0, _sre),
+    0x5B: Instruction("SRE", InstMode.AbsoluteY, 7, 0, _sre),
+    0x43: Instruction("SRE", InstMode.IndirectX, 6, 0, _sre),
+    0x53: Instruction("SRE", InstMode.IndirectY, 5, 0, _sre),
+
+    # RRA
+    0x67: Instruction("RRA", InstMode.ZeroPage, 5, 0, _rra),
+    0x77: Instruction("RRA", InstMode.ZeroPageX, 6, 0, _rra),
+    0x6F: Instruction("RRA", InstMode.Absolute, 6, 0, _rra),
+    0x7F: Instruction("RRA", InstMode.AbsoluteX, 7, 0, _rra),
+    0x7B: Instruction("RRA", InstMode.AbsoluteY, 7, 0, _rra),
+    0x63: Instruction("RRA", InstMode.IndirectX, 6, 0, _rra),
+    0x73: Instruction("RRA", InstMode.IndirectY, 5, 0, _rra),
+
+    # immediate combinations
+    0x0B: Instruction("ANC", InstMode.Immediate, 2, 0, _anc),
+    0x2B: Instruction("ANC", InstMode.Immediate, 2, 0, _anc),
+    0x4B: Instruction("ALR", InstMode.Immediate, 2, 0, _alr),
+    0x6B: Instruction("ARR", InstMode.Immediate, 2, 0, _arr),
+    0xCB: Instruction("SBX", InstMode.Immediate, 2, 0, _sbx),
+
+    # unstable stores
+    0xBB: Instruction("LAS", InstMode.AbsoluteY, 4, 1, _las),
+    0x93: Instruction("AHX", InstMode.IndirectY, 6, 0, _ahx),
+    0x9F: Instruction("AHX", InstMode.AbsoluteY, 5, 0, _ahx),
+    0x9E: Instruction("SHX", InstMode.AbsoluteY, 5, 0, _shx),
+    0x9C: Instruction("SHY", InstMode.AbsoluteX, 5, 0, _shy),
+    0x9B: Instruction("TAS", InstMode.AbsoluteY, 5, 0, _tas),
+
+    # multi byte NOPs
+    0x80: Instruction("NOP", InstMode.Immediate, 2, 0, _nop),
+    0x04: Instruction("NOP", InstMode.ZeroPage, 3, 0, _nop),
+    0x44: Instruction("NOP", InstMode.ZeroPage, 3, 0, _nop),
+    0x64: Instruction("NOP", InstMode.ZeroPage, 3, 0, _nop),
+    0x14: Instruction("NOP", InstMode.ZeroPageX, 4, 0, _nop),
+    0x34: Instruction("NOP", InstMode.ZeroPageX, 4, 0, _nop),
+    0x54: Instruction("NOP", InstMode.ZeroPageX, 4, 0, _nop),
+    0x74: Instruction("NOP", InstMode.ZeroPageX, 4, 0, _nop),
+    0xD4: Instruction("NOP", InstMode.ZeroPageX, 4, 0, _nop),
+    0xF4: Instruction("NOP", InstMode.ZeroPageX, 4, 0, _nop),
+    0x0C: Instruction("NOP", InstMode.Absolute, 4, 0, _nop),
+    0x1C: Instruction("NOP", InstMode.AbsoluteX, 4, 1, _nop),
+    0x3C: Instruction("NOP", InstMode.AbsoluteX, 4, 1, _nop),
+    0x5C: Instruction("NOP", InstMode.AbsoluteX, 4, 1, _nop),
+    0x7C: Instruction("NOP", InstMode.AbsoluteX, 4, 1, _nop),
+    0xDC: Instruction("NOP", InstMode.AbsoluteX, 4, 1, _nop),
+    0xFC: Instruction("NOP", InstMode.AbsoluteX, 4, 1, _nop),
+    0x1A: Instruction("NOP", InstMode.Implied, 2, 0, _nop),
+    0x3A: Instruction("NOP", InstMode.Implied, 2, 0, _nop),
+    0x5A: Instruction("NOP", InstMode.Implied, 2, 0, _nop),
+    0x7A: Instruction("NOP", InstMode.Implied, 2, 0, _nop),
+    0xDA: Instruction("NOP", InstMode.Implied, 2, 0, _nop),
+    0xFA: Instruction("NOP", InstMode.Implied, 2, 0, _nop),
+
+    # JAM / KIL
+    0x12: Instruction("JAM", InstMode.Implied, 2, 0, _jam),
+    0x22: Instruction("JAM", InstMode.Implied, 2, 0, _jam),
+    0x32: Instruction("JAM", InstMode.Implied, 2, 0, _jam),
+    0x42: Instruction("JAM", InstMode.Implied, 2, 0, _jam),
+    0x52: Instruction("JAM", InstMode.Implied, 2, 0, _jam),
+    0x62: Instruction("JAM", InstMode.Implied, 2, 0, _jam),
+    0x72: Instruction("JAM", InstMode.Implied, 2, 0, _jam),
+    0x92: Instruction("JAM", InstMode.Implied, 2, 0, _jam),
+    0xB2: Instruction("JAM", InstMode.Implied, 2, 0, _jam),
+    0xD2: Instruction("JAM", InstMode.Implied, 2, 0, _jam),
+    0xF2: Instruction("JAM", InstMode.Implied, 2, 0, _jam),
 }
+
+
+# --- introspection ---------------------------------------------------------
+
+def hex_byte(value: i64) -> str:
+    digits = "0123456789ABCDEF"
+    return digits[(value >> 4) & 0x0F] + digits[value & 0x0F]
+
+
+# The 256 opcode values, built one hex pair at a time so every entry is a real
+# byte value.
+def opcode_values() -> list[byte]:
+    data = bytes.zeros(0)
+    value = 0
+    while value < 256:
+        data = bytes.concat(data, bytes.from_hex(hex_byte(value)))
+        value += 1
+    return data
+
+
+# The opcode table is keyed by a byte, and only a byte that was declared
+# together with its value works as a key: `x as byte`, a `bytes.get` call
+# written inline and even assigning to a byte variable afterwards all miss the
+# table. These two helpers are the only place the table is read by number.
+def implemented_at(codes: list[byte], index: i64) -> bool:
+    opcode: byte = bytes.get(codes, index)
+    return INST_MAP.get(opcode) is not None
+
+
+def name_at(codes: list[byte], index: i64) -> str:
+    opcode: byte = bytes.get(codes, index)
+    entry = INST_MAP.get(opcode)
+    if entry is None:
+        return ""
+    return str(entry)
+
+
+# One line per implemented opcode, so the table can be audited from the CLI.
+def dump_table() -> str:
+    codes = opcode_values()
+    lines = ""
+    index = 0
+    while index < 256:
+        name = name_at(codes, index)
+        if len(name) > 0:
+            lines = lines + f"${hex_byte(index)}  {name}" + bytes.to_str(bytes.from_hex("0A"))
+        index += 1
+    return lines
+
+
+# Opcodes the table has no entry for, as a space separated hex list.
+def missing_opcodes() -> str:
+    codes = opcode_values()
+    text = ""
+    index = 0
+    while index < 256:
+        if not implemented_at(codes, index):
+            text = text + hex_byte(index) + " "
+        index += 1
+    return text
+
+
+def implemented_count() -> i64:
+    codes = opcode_values()
+    count = 0
+    index = 0
+    while index < 256:
+        if implemented_at(codes, index):
+            count += 1
+        index += 1
+    return count
 
 
 # Decode `opcode` and run it against `vm`, charging its cycle cost.

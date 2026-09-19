@@ -69,6 +69,7 @@ struct Program:
     size: i64
     image: list[byte]
     errors: str
+    symbols: str
 
     def ok(self) -> bool:
         return len(self.errors) == 0
@@ -169,6 +170,18 @@ def operand_size(mode: str) -> i64:
     if mode == M_IND:
         return 2
     return 1
+
+
+# Opcode lookup. A dict read reports "missing" and "stored zero" the same way,
+# and BRK's opcode is $00, so every table read goes through here instead: the
+# result is -1 only when the mnemonic really has no such addressing mode.
+def opcode_of(key: str) -> i64:
+    value = OPS.get(key)
+    if value is None:
+        if key == "BRK:IMP" or key == "BRK:IMM":
+            return 0
+        return -1
+    return value
 
 
 class Assembler:
@@ -330,9 +343,11 @@ class Assembler:
             if found < 0:
                 return -1
             position = start + found
-            if position == 0 or self.labels[position - 1] == ";":
-                return self.parse_dec(self.labels, position + i32(len(needle)))
-            start = position + 1
+            if position > 0:
+                if self.labels[position - 1] != ";":
+                    start = position + 1
+                    continue
+            return self.parse_dec(self.labels, position + i32(len(needle)))
         return -1
 
     def parse_dec(self, text: str, start: i64) -> i64:
@@ -852,9 +867,11 @@ class Assembler:
             if found < 0:
                 return -1
             position = start + found
-            if position == 0 or self.macro_store[position - 1] == unit():
-                return position
-            start = position + 1
+            if position > 0:
+                if self.macro_store[position - 1] != unit():
+                    start = position + 1
+                    continue
+            return position
         return -1
 
     def macro_params(self, entry: i64) -> str:
@@ -997,11 +1014,11 @@ class Assembler:
         if self.expand_macro(name, operand):
             return
         mode = self.classify(name, operand)
-        opcode = OPS.get(name + ":" + mode)
-        if opcode is None:
+        code = opcode_of(name + ":" + mode)
+        if code < 0:
             self.fail(f"'{name}' has no {mode} addressing mode")
             return
-        self.emit(opcode)
+        self.emit(code)
         self.emit_operand(mode)
 
     def emit_operand(self, mode: str) -> void:
@@ -1027,14 +1044,14 @@ class Assembler:
         self.operand_value = 0
         raw = string.strip(text)
         if len(raw) == 0:
-            if OPS.get(name + ":" + M_IMP) is not None:
+            if opcode_of(name + ":" + M_IMP) >= 0:
                 return M_IMP
             return M_ACC
         if raw[0] == "#":
             self.read_operand(raw[1:])
             return M_IMM
         if string.upper(raw) == "A":
-            if OPS.get(name + ":" + M_ACC) is not None:
+            if opcode_of(name + ":" + M_ACC) >= 0:
                 return M_ACC
         if raw[0] == "(":
             close = string.find(raw, ")")
@@ -1065,9 +1082,9 @@ class Assembler:
         self.read_operand(raw)
         if self.zero_page_ok(name, M_ZP):
             return M_ZP
-        if OPS.get(name + ":" + M_ABS) is not None:
+        if opcode_of(name + ":" + M_ABS) >= 0:
             return M_ABS
-        if OPS.get(name + ":" + M_REL) is not None:
+        if opcode_of(name + ":" + M_REL) >= 0:
             return M_REL
         return M_ABS
 
@@ -1082,7 +1099,7 @@ class Assembler:
             return False
         if self.operand_value < 0 or self.operand_value > 0xFF:
             return False
-        return OPS.get(name + ":" + mode) is not None
+        return opcode_of(name + ":" + mode) >= 0
 
 
 def assemble(source: str, origin: i64) -> Program:
@@ -1092,7 +1109,7 @@ def assemble(source: str, origin: i64) -> Program:
     size = tool.highest - origin
     if size < 0:
         size = 0
-    return Program(origin, size, tool.image, tool.errors)
+    return Program(origin, size, tool.image, tool.errors, tool.labels)
 
 
 # The assembled bytes on their own, ready for VM.load.

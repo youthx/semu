@@ -8,7 +8,7 @@ import asm6502
 import processor
 from graphics import gfx_blit, gfx_frame, gfx_init, gfx_poll, gfx_shutdown, input_state
 from graphics import ACTION_FASTER, ACTION_QUIT, ACTION_RESET, ACTION_SLOWER, ACTION_STEP, ACTION_TOGGLE_RUN
-from graphics import STATE_READY, STATE_ERROR, STATE_HALTED, STATE_PAUSED, STATE_RUNNING
+from graphics import STATE_READY, STATE_ERROR, STATE_HALTED, STATE_PAUSED, STATE_RUNNING, STATE_ENDED
 from vm import PROGRAM_START, VM
 
 # Where the host keyboard is published for the CPU to read. The NES uses $4016
@@ -32,6 +32,13 @@ const DEFAULT_SPEED: i64 = 12000
 
 static vm: VM = VM(MEMORY_SIZE)
 static logger: log.Logger = log.get_logger("semu")
+
+# The address window of the loaded program. A flat image has no natural end, so
+# the CPU stops when it runs past the last byte instead of executing whatever
+# happens to follow in memory.
+static program_start: i64 = 0
+static program_end: i64 = 0
+static program_ended: bool = False
 
 
 def hex_byte(value: i64) -> str:
@@ -193,6 +200,9 @@ def load_source(source: str, origin: i64) -> bool:
         logger.error("assembly failed:" + newline() + program.errors)
         return False
     logger.info(f"assembled {program.size} bytes at ${hex_word(origin)}")
+    program_start = origin
+    program_end = origin + program.size
+    program_ended = False
     vm.load(asm6502.code_window(program), origin)
     return True
 
@@ -214,21 +224,78 @@ def load_path(path: str, origin: i64) -> bool:
     else:
         image = bytes.from_str(text)
     logger.info(f"loaded {len(image)} bytes from {path} at ${hex_word(origin)}")
+    program_start = origin
+    program_end = origin + len(image)
+    program_ended = False
     vm.load(image, origin)
     return True
 
 
-def load_program(argv: list[str]) -> void:
+def load_program(argv: list[str]) -> bool:
+    program_ended = False
     vm.reset(PROGRAM_START)
     clear_screen()
     path = program_path(argv)
     if len(path) > 0:
         if load_path(path, program_origin(argv)):
             vm.run()
-            return
+            return True
         logger.error("falling back to the built in demo")
     if load_source(DEMO, PROGRAM_START):
         vm.run()
+        return True
+    return False
+
+
+# True while the program counter is inside the loaded image.
+def in_program() -> bool:
+    if program_end <= program_start:
+        return True
+    return vm.pc >= program_start and vm.pc < program_end
+
+
+# Runs a program without opening a window, then reports the CPU state. Handy
+# for checking a ROM from the command line.
+def run_headless(argv: list[str], limit: i64) -> i32:
+    if not load_program(argv):
+        return 1
+    executed = 0
+    while executed < limit:
+        if not vm.is_running():
+            break
+        if not in_program():
+            print("program ended")
+            break
+        if not step():
+            break
+        executed += 1
+    print(f"steps   {executed}")
+    print(f"state   A=${hex_byte(vm.A)} X=${hex_byte(vm.X)} Y=${hex_byte(vm.Y)} SP=${hex_byte(vm.SP)} P=${hex_byte(vm.P)} PC=${hex_word(vm.pc)}")
+    print(f"$0300   ${hex_byte(vm.read(0x0300))} ${hex_byte(vm.read(0x0301))} ${hex_byte(vm.read(0x0302))} ${hex_byte(vm.read(0x0303))}")
+    peek = option_value(argv, "--peek=")
+    if len(peek) > 0:
+        peek_memory(peek)
+    return 0
+
+
+# --peek=0x4000:64 dumps memory as hex, so a windowless run can be inspected.
+def peek_memory(spec: str) -> void:
+    colon = string.find(spec, ":")
+    address = parse_address(spec)
+    count = 64
+    if colon >= 0:
+        count = parse_address(spec[colon + 1:])
+    index = 0
+    line = ""
+    while index < count:
+        if index % 16 == 0:
+            if index > 0:
+                print(line)
+            line = hex_word(address + index)
+        line = line + " " + hex_byte(vm.read(address + index) as i64)
+        index += 1
+    if len(line) > 0:
+        print(line)
 
 
 # Fetch, decode and run one instruction. The machine is passed as &vm so the
@@ -296,6 +363,8 @@ def compile_only(argv: list[str], out_path: str) -> i32:
         logger.error("assembly failed:" + newline() + program.errors)
         return 1
     logger.info(f"assembled {program.size} bytes at ${hex_word(origin)}")
+    if has_option(argv, "--symbols"):
+        print(string.replace(program.symbols, ";", newline()))
     if len(out_path) > 0:
         if not fs.write_text(out_path, asm6502.code_hex(program)):
             logger.error(f"could not write {out_path}")
@@ -310,7 +379,18 @@ def compile_only(argv: list[str], out_path: str) -> i32:
 
 
 def main(argv: list[str]) -> i32:
+    if has_option(argv, "--dump-cpu"):
+        print(processor.dump_table())
+        logger.info(f"{processor.implemented_count()} opcodes implemented")
+        missing = processor.missing_opcodes()
+        if len(missing) > 0:
+            logger.info(f"no entry for: {missing}")
+        return 0
+
     out_path = option_value(argv, "--out=")
+    run_count = option_value(argv, "--run=")
+    if len(run_count) > 0:
+        return run_headless(argv, parse_address(run_count))
     if has_option(argv, "--check") or len(out_path) > 0:
         return compile_only(argv, out_path)
 
@@ -340,7 +420,11 @@ def main(argv: list[str]) -> i32:
             paused = True
             if not vm.is_running():
                 load_program(argv)
-            step()
+            if in_program():
+                step()
+            else:
+                program_ended = True
+                vm.halt()
             blit_screen()
         elif action == ACTION_RESET:
             # Reload the program but leave the CPU stopped: reset should not
@@ -361,6 +445,11 @@ def main(argv: list[str]) -> i32:
         if not paused:
             used = 0
             while used < speed and vm.is_running():
+                if not in_program():
+                    # Ran past the last byte of the image: stop cleanly.
+                    program_ended = True
+                    vm.halt()
+                    break
                 before = vm.cycles
                 if not step():
                     failed = True
@@ -373,6 +462,8 @@ def main(argv: list[str]) -> i32:
         state = STATE_READY
         if failed:
             state = STATE_ERROR
+        elif program_ended:
+            state = STATE_ENDED
         elif not vm.is_running():
             state = STATE_HALTED
         elif paused:

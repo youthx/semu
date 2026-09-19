@@ -45,3 +45,4 @@ const STATE_RUNNING: i64 = 1
 const STATE_PAUSED: i64 = 2
 const STATE_HALTED: i64 = 3
 const STATE_ERROR: i64 = 4
+const STATE_ENDED: i64 = 5

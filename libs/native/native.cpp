@@ -121,6 +121,7 @@ enum {
   STATE_PAUSED = 2,
   STATE_HALTED = 3,
   STATE_ERROR = 4,
+  STATE_ENDED = 5,
 };
 
 // --- window and emulated screen -------------------------------------------
@@ -269,6 +270,7 @@ static void draw_flags(float y, int64_t status) {
 
 static const char* state_text(int64_t state) {
   if (state == STATE_ERROR) return "ERROR";
+  if (state == STATE_ENDED) return "ENDED";
   if (state == STATE_HALTED) return "HALTED";
   if (state == STATE_PAUSED) return "PAUSED";
   if (state == STATE_RUNNING) return "RUNNING";
@@ -277,6 +279,7 @@ static const char* state_text(int64_t state) {
 
 static uint32_t state_color(int64_t state) {
   if (state == STATE_ERROR) return COLOR_BAD;
+  if (state == STATE_ENDED) return COLOR_WARN;
   if (state == STATE_HALTED) return COLOR_DIM;
   if (state == STATE_PAUSED) return COLOR_WARN;
   if (state == STATE_RUNNING) return COLOR_GOOD;
@@ -375,7 +378,8 @@ static void draw_panel(int64_t a, int64_t x, int64_t y, int64_t sp, int64_t pc, 
 
   // Focused: the controls are greyed out and only ESC or a click on the screen
   // gives the keyboard back to the debugger.
-  const bool paused = (state == STATE_PAUSED) || (state == STATE_HALTED) || (state == STATE_ERROR);
+  const bool paused = (state == STATE_PAUSED) || (state == STATE_HALTED) || (state == STATE_ERROR) ||
+                      (state == STATE_ENDED);
   draw_button(buttons[0], paused ? "RUN" : "PAUSE", !paused && !screen_focus);
   draw_button(buttons[1], "STEP", false);
   draw_button(buttons[2], "RESET", false);

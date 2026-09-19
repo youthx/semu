@@ -1,102 +1,750 @@
-from vm import VM
+from vm import VM, FLAG_C, FLAG_D, FLAG_I, FLAG_N, FLAG_V, FLAG_Z
 
-# How an instruction locates its operand in memory.
+# How an instruction locates its operand.
 enum InstMode:
     Immediate
+    ZeroPage
+    ZeroPageX
+    ZeroPageY
+    Absolute
+    AbsoluteX
+    AbsoluteY
+    Indirect
+    IndirectX
+    IndirectY
+    Relative
+    Accumulator
+    Implied
 
     def get_name(self) -> str:
         match self:
             case InstMode.Immediate:
                 return "immediate"
+            case InstMode.ZeroPage:
+                return "zero page"
+            case InstMode.ZeroPageX:
+                return "zero page,X"
+            case InstMode.ZeroPageY:
+                return "zero page,Y"
+            case InstMode.Absolute:
+                return "absolute"
+            case InstMode.AbsoluteX:
+                return "absolute,X"
+            case InstMode.AbsoluteY:
+                return "absolute,Y"
+            case InstMode.Indirect:
+                return "indirect"
+            case InstMode.IndirectX:
+                return "(indirect,X)"
+            case InstMode.IndirectY:
+                return "(indirect),Y"
+            case InstMode.Relative:
+                return "relative"
+            case InstMode.Accumulator:
+                return "accumulator"
+            case InstMode.Implied:
+                return "implied"
 
 
-# One decoded instruction: mnemonic, addressing mode, and the code that runs it.
-# Handlers take the machine as a Ptr[VM] so they mutate the caller's VM instead
-# of a copy of it.
+# The result of decoding an operand: the effective address, the byte the
+# instruction sees, and whether an indexed access crossed a page boundary
+# (which costs an extra cycle). `address` is -1 when the mode has no memory
+# operand (implied, immediate, accumulator).
+struct Operand:
+    address: i64
+    value: byte
+    page_crossed: bool
+
+
+# One decoded instruction: mnemonic, addressing mode, base cycle count, whether
+# an indexed read crossed a page boundary (+1 cycle), and the code that runs it.
+#
+# Handlers receive the machine as a Ptr[VM] plus the decoded operand unpacked
+# into scalars, because this compiler cannot pass an aggregate through the
+# Callable field, and a bool field ahead of the Callable corrupts the pointer.
 struct Instruction:
     name: str
     mode: InstMode
-    handler: Callable[[Ptr[VM], InstMode], None]
+    cycles: i64
+    page_penalty: i64
+    handler: Callable[[Ptr[VM], i64, i64], None]
 
     def __str__(self) -> str:
         return f"{self.name} {self.mode.get_name()}"
 
-def _hlt(vm: Ptr[VM], mode: InstMode) -> None:
+
+# --- helpers ---------------------------------------------------------------
+
+def _crossed(base: i64, address: i64) -> bool:
+    return (base & 0xFF00) != (address & 0xFF00)
+
+
+def _carry_in(vm: Ptr[VM]) -> i64:
+    if (*vm).get_flag(FLAG_C):
+        return 1
+    return 0
+
+
+def _set_zn(vm: Ptr[VM], value: i64) -> void:
+    (*vm).set_flag(FLAG_Z, (value & 0xFF) == 0)
+    (*vm).set_flag(FLAG_N, (value & 0x80) != 0)
+
+
+# Write back a read-modify-write result: to A for accumulator mode (where the
+# address is -1), otherwise to memory.
+def _store(vm: Ptr[VM], address: i64, value: i64) -> void:
+    if address < 0:
+        (*vm).A = value & 0xFF
+    else:
+        (*vm).write(address, (value & 0xFF) as byte)
+
+
+def _compare(vm: Ptr[VM], register_value: i64, value: i64) -> void:
+    operand = value & 0xFF
+    (*vm).set_flag(FLAG_C, register_value >= operand)
+    _set_zn(vm, (register_value - operand) & 0xFF)
+
+
+# Branches cost one extra cycle when taken, and another when they cross a page.
+def _branch(vm: Ptr[VM], address: i64, taken: bool) -> void:
+    if not taken:
+        return
+
+    (*vm).add_cycles(1)
+    if _crossed((*vm).pc, address):
+        (*vm).add_cycles(1)
+
+    (*vm).pc = address
+
+
+# --- loads and stores ------------------------------------------------------
+
+def _lda(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).A = value & 0xFF
+    _set_zn(vm, (*vm).A)
+
+
+def _ldx(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).X = value & 0xFF
+    _set_zn(vm, (*vm).X)
+
+
+def _ldy(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).Y = value & 0xFF
+    _set_zn(vm, (*vm).Y)
+
+
+def _sta(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).write(address, (*vm).A as byte)
+
+
+def _stx(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).write(address, (*vm).X as byte)
+
+
+def _sty(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).write(address, (*vm).Y as byte)
+
+
+# --- register transfers ----------------------------------------------------
+
+def _tax(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).X = (*vm).A
+    _set_zn(vm, (*vm).X)
+
+
+def _tay(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).Y = (*vm).A
+    _set_zn(vm, (*vm).Y)
+
+
+def _txa(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).A = (*vm).X
+    _set_zn(vm, (*vm).A)
+
+
+def _tya(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).A = (*vm).Y
+    _set_zn(vm, (*vm).A)
+
+
+def _tsx(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).X = (*vm).SP
+    _set_zn(vm, (*vm).X)
+
+
+def _txs(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).SP = (*vm).X & 0xFF
+
+
+# --- stack -----------------------------------------------------------------
+
+def _pha(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).push((*vm).A as byte)
+
+
+def _php(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).push((*vm).status())
+
+
+def _pla(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).A = (*vm).pop() as i64
+    _set_zn(vm, (*vm).A)
+
+
+def _plp(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).set_status((*vm).pop())
+
+
+# --- logic -----------------------------------------------------------------
+
+def _and(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).A = (*vm).A & (value & 0xFF)
+    _set_zn(vm, (*vm).A)
+
+
+def _ora(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).A = (*vm).A | (value & 0xFF)
+    _set_zn(vm, (*vm).A)
+
+
+def _eor(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).A = (*vm).A ^ (value & 0xFF)
+    _set_zn(vm, (*vm).A)
+
+
+def _bit(vm: Ptr[VM], address: i64, value: i64) -> void:
+    operand = value & 0xFF
+    (*vm).set_flag(FLAG_Z, ((*vm).A & operand) == 0)
+    (*vm).set_flag(FLAG_N, (operand & 0x80) != 0)
+    (*vm).set_flag(FLAG_V, (operand & 0x40) != 0)
+
+
+# --- arithmetic ------------------------------------------------------------
+
+def _adc(vm: Ptr[VM], address: i64, value: i64) -> void:
+    operand = value & 0xFF
+    accumulator = (*vm).A
+    carry = _carry_in(vm)
+    total = accumulator + operand + carry
+    binary = total & 0xFF
+    result = binary
+
+    if (*vm).get_flag(FLAG_D):
+        low = (accumulator & 0x0F) + (operand & 0x0F) + carry
+        high = (accumulator >> 4) + (operand >> 4)
+        if low > 9:
+            low = low + 6
+            high = high + 1
+        (*vm).set_flag(FLAG_C, high > 15)
+        if high > 9:
+            high = high + 6
+        result = ((high << 4) | (low & 0x0F)) & 0xFF
+    else:
+        (*vm).set_flag(FLAG_C, total > 0xFF)
+
+    (*vm).set_flag(FLAG_V, (((accumulator ^ binary) & (operand ^ binary)) & 0x80) != 0)
+    (*vm).A = result
+    _set_zn(vm, result)
+
+
+def _sbc(vm: Ptr[VM], address: i64, value: i64) -> void:
+    operand = value & 0xFF
+    accumulator = (*vm).A
+    borrow = 1 - _carry_in(vm)
+    total = accumulator - operand - borrow
+    binary = total & 0xFF
+    result = binary
+
+    if (*vm).get_flag(FLAG_D):
+        low = (accumulator & 0x0F) - (operand & 0x0F) - borrow
+        high = (accumulator >> 4) - (operand >> 4)
+        if low < 0:
+            low = low - 6
+            high = high - 1
+        if high < 0:
+            high = high - 6
+        result = ((high << 4) | (low & 0x0F)) & 0xFF
+
+    (*vm).set_flag(FLAG_C, total >= 0)
+    (*vm).set_flag(FLAG_V, (((accumulator ^ operand) & (accumulator ^ binary)) & 0x80) != 0)
+    (*vm).A = result
+    _set_zn(vm, result)
+
+
+def _cmp(vm: Ptr[VM], address: i64, value: i64) -> void:
+    _compare(vm, (*vm).A, value)
+
+
+def _cpx(vm: Ptr[VM], address: i64, value: i64) -> void:
+    _compare(vm, (*vm).X, value)
+
+
+def _cpy(vm: Ptr[VM], address: i64, value: i64) -> void:
+    _compare(vm, (*vm).Y, value)
+
+
+# --- increment and decrement -----------------------------------------------
+
+def _inc(vm: Ptr[VM], address: i64, value: i64) -> void:
+    result = ((value & 0xFF) + 1) & 0xFF
+    _store(vm, address, result)
+    _set_zn(vm, result)
+
+
+def _dec(vm: Ptr[VM], address: i64, value: i64) -> void:
+    result = ((value & 0xFF) - 1) & 0xFF
+    _store(vm, address, result)
+    _set_zn(vm, result)
+
+
+def _inx(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).X = ((*vm).X + 1) & 0xFF
+    _set_zn(vm, (*vm).X)
+
+
+def _iny(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).Y = ((*vm).Y + 1) & 0xFF
+    _set_zn(vm, (*vm).Y)
+
+
+def _dex(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).X = ((*vm).X - 1) & 0xFF
+    _set_zn(vm, (*vm).X)
+
+
+def _dey(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).Y = ((*vm).Y - 1) & 0xFF
+    _set_zn(vm, (*vm).Y)
+
+
+# --- shifts and rotates ----------------------------------------------------
+
+def _asl(vm: Ptr[VM], address: i64, value: i64) -> void:
+    operand = value & 0xFF
+    (*vm).set_flag(FLAG_C, (operand & 0x80) != 0)
+    result = (operand << 1) & 0xFF
+    _store(vm, address, result)
+    _set_zn(vm, result)
+
+
+def _lsr(vm: Ptr[VM], address: i64, value: i64) -> void:
+    operand = value & 0xFF
+    (*vm).set_flag(FLAG_C, (operand & 0x01) != 0)
+    result = (operand >> 1) & 0x7F
+    _store(vm, address, result)
+    _set_zn(vm, result)
+
+
+def _rol(vm: Ptr[VM], address: i64, value: i64) -> void:
+    operand = value & 0xFF
+    carry = _carry_in(vm)
+    (*vm).set_flag(FLAG_C, (operand & 0x80) != 0)
+    result = ((operand << 1) & 0xFF) | carry
+    _store(vm, address, result)
+    _set_zn(vm, result)
+
+
+def _ror(vm: Ptr[VM], address: i64, value: i64) -> void:
+    operand = value & 0xFF
+    carry = _carry_in(vm)
+    (*vm).set_flag(FLAG_C, (operand & 0x01) != 0)
+    result = ((operand >> 1) & 0x7F) | (carry << 7)
+    _store(vm, address, result)
+    _set_zn(vm, result)
+
+
+# --- jumps and calls -------------------------------------------------------
+
+def _jmp(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).pc = address
+
+
+def _jsr(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).push_word(((*vm).pc - 1) & 0xFFFF)
+    (*vm).pc = address
+
+
+def _rts(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).pc = ((*vm).pop_word() + 1) & 0xFFFF
+
+
+def _rti(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).set_status((*vm).pop())
+    (*vm).pc = (*vm).pop_word()
+
+
+def _brk(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).software_break()
+
+
+# --- branches --------------------------------------------------------------
+
+def _bcc(vm: Ptr[VM], address: i64, value: i64) -> void:
+    _branch(vm, address, not (*vm).get_flag(FLAG_C))
+
+
+def _bcs(vm: Ptr[VM], address: i64, value: i64) -> void:
+    _branch(vm, address, (*vm).get_flag(FLAG_C))
+
+
+def _beq(vm: Ptr[VM], address: i64, value: i64) -> void:
+    _branch(vm, address, (*vm).get_flag(FLAG_Z))
+
+
+def _bne(vm: Ptr[VM], address: i64, value: i64) -> void:
+    _branch(vm, address, not (*vm).get_flag(FLAG_Z))
+
+
+def _bmi(vm: Ptr[VM], address: i64, value: i64) -> void:
+    _branch(vm, address, (*vm).get_flag(FLAG_N))
+
+
+def _bpl(vm: Ptr[VM], address: i64, value: i64) -> void:
+    _branch(vm, address, not (*vm).get_flag(FLAG_N))
+
+
+def _bvc(vm: Ptr[VM], address: i64, value: i64) -> void:
+    _branch(vm, address, not (*vm).get_flag(FLAG_V))
+
+
+def _bvs(vm: Ptr[VM], address: i64, value: i64) -> void:
+    _branch(vm, address, (*vm).get_flag(FLAG_V))
+
+
+# --- flag control ----------------------------------------------------------
+
+def _clc(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).set_flag(FLAG_C, False)
+
+
+def _sec(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).set_flag(FLAG_C, True)
+
+
+def _cli(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).set_flag(FLAG_I, False)
+
+
+def _sei(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).set_flag(FLAG_I, True)
+
+
+def _cld(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).set_flag(FLAG_D, False)
+
+
+def _sed(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).set_flag(FLAG_D, True)
+
+
+def _clv(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).set_flag(FLAG_V, False)
+
+
+# --- system ----------------------------------------------------------------
+
+def _nop(vm: Ptr[VM], address: i64, value: i64) -> void:
+    return
+
+
+def _hlt(vm: Ptr[VM], address: i64, value: i64) -> void:
+    (*vm).halt()
+
+
+# --- addressing modes ------------------------------------------------------
+
+# Consume the operand bytes for `mode` and report the effective address, the
+# byte the instruction sees, and whether an indexed access crossed a page.
+def resolve(vm: Ptr[VM], mode: InstMode) -> Operand:
     match mode:
         case InstMode.Immediate:
-            (*vm).halt()
+            return Operand(-1, (*vm).read_byte(), False)
 
-def _lda(vm: Ptr[VM], mode: InstMode) -> None:
-    match mode:
-        case InstMode.Immediate:
-            (*vm).A = (*vm).read_byte()
+        case InstMode.Implied:
+            return Operand(-1, 0, False)
 
-def _ldx(vm: Ptr[VM], mode: InstMode) -> None:
-    match mode:
-        case InstMode.Immediate:
-            (*vm).X = (*vm).read_byte()
+        case InstMode.Accumulator:
+            return Operand(-1, (*vm).A as byte, False)
 
-def _ldy(vm: Ptr[VM], mode: InstMode) -> None:
-    match mode:
-        case InstMode.Immediate:
-            (*vm).Y = (*vm).read_byte()
+        case InstMode.ZeroPage:
+            zero_page = (*vm).read_byte() as i64
+            return Operand(zero_page, (*vm).read(zero_page), False)
 
-def _sta(vm: Ptr[VM], mode: InstMode) -> None:
-    lsb = (*vm).read_byte_at((*vm).pc + 1)
-    msb = (*vm).read_byte_at((*vm).pc + 2)
-    loc = msb * 256 + lsb
+        case InstMode.ZeroPageX:
+            zero_page = (((*vm).read_byte() as i64) + (*vm).X) & 0xFF
+            return Operand(zero_page, (*vm).read(zero_page), False)
 
-    (*vm).write_byte_at(loc, (*vm).A)
-    (*vm).pc += 3
+        case InstMode.ZeroPageY:
+            zero_page = (((*vm).read_byte() as i64) + (*vm).Y) & 0xFF
+            return Operand(zero_page, (*vm).read(zero_page), False)
 
-def _stx(vm: Ptr[VM], mode: InstMode) -> None:
-    lsb = (*vm).read_byte_at((*vm).pc + 1)
-    msb = (*vm).read_byte_at((*vm).pc + 2)
-    loc = msb * 256 + lsb
+        case InstMode.Absolute:
+            absolute = (*vm).read_word()
+            return Operand(absolute, (*vm).read(absolute), False)
 
-    (*vm).write_byte_at(loc, (*vm).X)
-    (*vm).pc += 3
+        case InstMode.AbsoluteX:
+            base = (*vm).read_word()
+            effective = (base + (*vm).X) & 0xFFFF
+            return Operand(effective, (*vm).read(effective), _crossed(base, effective))
 
-def _sty(vm: Ptr[VM], mode: InstMode) -> None:
-    lsb = (*vm).read_byte_at((*vm).pc + 1)
-    msb = (*vm).read_byte_at((*vm).pc + 2)
-    loc = msb * 256 + lsb
+        case InstMode.AbsoluteY:
+            base = (*vm).read_word()
+            effective = (base + (*vm).Y) & 0xFFFF
+            return Operand(effective, (*vm).read(effective), _crossed(base, effective))
 
-    (*vm).write_byte_at(loc, (*vm).Y)
-    (*vm).pc += 3
+        case InstMode.Indirect:
+            # JMP ($xxFF) still reads its high byte from $xx00 on the NMOS chip.
+            pointer = (*vm).read_word()
+            low = (*vm).read(pointer) as i64
+            high = (*vm).read((pointer & 0xFF00) | ((pointer + 1) & 0xFF)) as i64
+            return Operand(low | (high << 8), 0, False)
 
-def _sty(vm: Ptr[VM], mode: InstMode) -> None:
-    lsb = (*vm).read_byte_at((*vm).pc + 1)
-    msb = (*vm).read_byte_at((*vm).pc + 2)
-    loc = msb * 256 + lsb
+        case InstMode.IndirectX:
+            zero_page = (((*vm).read_byte() as i64) + (*vm).X) & 0xFF
+            low = (*vm).read(zero_page) as i64
+            high = (*vm).read((zero_page + 1) & 0xFF) as i64
+            effective = low | (high << 8)
+            return Operand(effective, (*vm).read(effective), False)
 
-    (*vm).write_byte_at(loc, (*vm).Y)
-    (*vm).pc += 3
+        case InstMode.IndirectY:
+            zero_page = (*vm).read_byte() as i64
+            low = (*vm).read(zero_page) as i64
+            high = (*vm).read((zero_page + 1) & 0xFF) as i64
+            base = low | (high << 8)
+            effective = (base + (*vm).Y) & 0xFFFF
+            return Operand(effective, (*vm).read(effective), _crossed(base, effective))
+
+        case InstMode.Relative:
+            offset = (*vm).read_byte() as i64
+            if offset >= 0x80:
+                offset = offset - 0x100
+            return Operand(((*vm).pc + offset) & 0xFFFF, 0, False)
 
 
+# --- opcode table ----------------------------------------------------------
 
-# Opcode -> instruction.
+# Official NMOS 6502 opcodes, grouped by mnemonic. The last number is the
+# page-cross penalty: 1 for indexed reads that cost an extra cycle, else 0.
+# HLT (0x02) is a convenience pseudo-opcode used by the demo programs.
 const INST_MAP = {
-    0x02: Instruction("HLT", InstMode.Immediate, _hlt),
-    0xA9: Instruction("LDA", InstMode.Immediate, _lda),
-    0xA2: Instruction("LDX", InstMode.Immediate, _ldx),
-    0xA0: Instruction("LDY", InstMode.Immediate, _ldy),
-    0x8D: Instruction("STA", InstMode.Immediate, _sta),
+    # LDA
+    0xA9: Instruction("LDA", InstMode.Immediate, 2, 0, _lda),
+    0xA5: Instruction("LDA", InstMode.ZeroPage, 3, 0, _lda),
+    0xB5: Instruction("LDA", InstMode.ZeroPageX, 4, 0, _lda),
+    0xAD: Instruction("LDA", InstMode.Absolute, 4, 0, _lda),
+    0xBD: Instruction("LDA", InstMode.AbsoluteX, 4, 1, _lda),
+    0xB9: Instruction("LDA", InstMode.AbsoluteY, 4, 1, _lda),
+    0xA1: Instruction("LDA", InstMode.IndirectX, 6, 0, _lda),
+    0xB1: Instruction("LDA", InstMode.IndirectY, 5, 1, _lda),
+
+    # LDX
+    0xA2: Instruction("LDX", InstMode.Immediate, 2, 0, _ldx),
+    0xA6: Instruction("LDX", InstMode.ZeroPage, 3, 0, _ldx),
+    0xB6: Instruction("LDX", InstMode.ZeroPageY, 4, 0, _ldx),
+    0xAE: Instruction("LDX", InstMode.Absolute, 4, 0, _ldx),
+    0xBE: Instruction("LDX", InstMode.AbsoluteY, 4, 1, _ldx),
+
+    # LDY
+    0xA0: Instruction("LDY", InstMode.Immediate, 2, 0, _ldy),
+    0xA4: Instruction("LDY", InstMode.ZeroPage, 3, 0, _ldy),
+    0xB4: Instruction("LDY", InstMode.ZeroPageX, 4, 0, _ldy),
+    0xAC: Instruction("LDY", InstMode.Absolute, 4, 0, _ldy),
+    0xBC: Instruction("LDY", InstMode.AbsoluteX, 4, 1, _ldy),
+
+    # STA
+    0x85: Instruction("STA", InstMode.ZeroPage, 3, 0, _sta),
+    0x95: Instruction("STA", InstMode.ZeroPageX, 4, 0, _sta),
+    0x8D: Instruction("STA", InstMode.Absolute, 4, 0, _sta),
+    0x9D: Instruction("STA", InstMode.AbsoluteX, 5, 0, _sta),
+    0x99: Instruction("STA", InstMode.AbsoluteY, 5, 0, _sta),
+    0x81: Instruction("STA", InstMode.IndirectX, 6, 0, _sta),
+    0x91: Instruction("STA", InstMode.IndirectY, 6, 0, _sta),
+
+    # STX / STY
+    0x86: Instruction("STX", InstMode.ZeroPage, 3, 0, _stx),
+    0x96: Instruction("STX", InstMode.ZeroPageY, 4, 0, _stx),
+    0x8E: Instruction("STX", InstMode.Absolute, 4, 0, _stx),
+    0x84: Instruction("STY", InstMode.ZeroPage, 3, 0, _sty),
+    0x94: Instruction("STY", InstMode.ZeroPageX, 4, 0, _sty),
+    0x8C: Instruction("STY", InstMode.Absolute, 4, 0, _sty),
+
+    # transfers
+    0xAA: Instruction("TAX", InstMode.Implied, 2, 0, _tax),
+    0xA8: Instruction("TAY", InstMode.Implied, 2, 0, _tay),
+    0x8A: Instruction("TXA", InstMode.Implied, 2, 0, _txa),
+    0x98: Instruction("TYA", InstMode.Implied, 2, 0, _tya),
+    0xBA: Instruction("TSX", InstMode.Implied, 2, 0, _tsx),
+    0x9A: Instruction("TXS", InstMode.Implied, 2, 0, _txs),
+
+    # stack
+    0x48: Instruction("PHA", InstMode.Implied, 3, 0, _pha),
+    0x08: Instruction("PHP", InstMode.Implied, 3, 0, _php),
+    0x68: Instruction("PLA", InstMode.Implied, 4, 0, _pla),
+    0x28: Instruction("PLP", InstMode.Implied, 4, 0, _plp),
+
+    # AND
+    0x29: Instruction("AND", InstMode.Immediate, 2, 0, _and),
+    0x25: Instruction("AND", InstMode.ZeroPage, 3, 0, _and),
+    0x35: Instruction("AND", InstMode.ZeroPageX, 4, 0, _and),
+    0x2D: Instruction("AND", InstMode.Absolute, 4, 0, _and),
+    0x3D: Instruction("AND", InstMode.AbsoluteX, 4, 1, _and),
+    0x39: Instruction("AND", InstMode.AbsoluteY, 4, 1, _and),
+    0x21: Instruction("AND", InstMode.IndirectX, 6, 0, _and),
+    0x31: Instruction("AND", InstMode.IndirectY, 5, 1, _and),
+
+    # ORA
+    0x09: Instruction("ORA", InstMode.Immediate, 2, 0, _ora),
+    0x05: Instruction("ORA", InstMode.ZeroPage, 3, 0, _ora),
+    0x15: Instruction("ORA", InstMode.ZeroPageX, 4, 0, _ora),
+    0x0D: Instruction("ORA", InstMode.Absolute, 4, 0, _ora),
+    0x1D: Instruction("ORA", InstMode.AbsoluteX, 4, 1, _ora),
+    0x19: Instruction("ORA", InstMode.AbsoluteY, 4, 1, _ora),
+    0x01: Instruction("ORA", InstMode.IndirectX, 6, 0, _ora),
+    0x11: Instruction("ORA", InstMode.IndirectY, 5, 1, _ora),
+
+    # EOR
+    0x49: Instruction("EOR", InstMode.Immediate, 2, 0, _eor),
+    0x45: Instruction("EOR", InstMode.ZeroPage, 3, 0, _eor),
+    0x55: Instruction("EOR", InstMode.ZeroPageX, 4, 0, _eor),
+    0x4D: Instruction("EOR", InstMode.Absolute, 4, 0, _eor),
+    0x5D: Instruction("EOR", InstMode.AbsoluteX, 4, 1, _eor),
+    0x59: Instruction("EOR", InstMode.AbsoluteY, 4, 1, _eor),
+    0x41: Instruction("EOR", InstMode.IndirectX, 6, 0, _eor),
+    0x51: Instruction("EOR", InstMode.IndirectY, 5, 1, _eor),
+
+    # BIT
+    0x24: Instruction("BIT", InstMode.ZeroPage, 3, 0, _bit),
+    0x2C: Instruction("BIT", InstMode.Absolute, 4, 0, _bit),
+
+    # ADC
+    0x69: Instruction("ADC", InstMode.Immediate, 2, 0, _adc),
+    0x65: Instruction("ADC", InstMode.ZeroPage, 3, 0, _adc),
+    0x75: Instruction("ADC", InstMode.ZeroPageX, 4, 0, _adc),
+    0x6D: Instruction("ADC", InstMode.Absolute, 4, 0, _adc),
+    0x7D: Instruction("ADC", InstMode.AbsoluteX, 4, 1, _adc),
+    0x79: Instruction("ADC", InstMode.AbsoluteY, 4, 1, _adc),
+    0x61: Instruction("ADC", InstMode.IndirectX, 6, 0, _adc),
+    0x71: Instruction("ADC", InstMode.IndirectY, 5, 1, _adc),
+
+    # SBC
+    0xE9: Instruction("SBC", InstMode.Immediate, 2, 0, _sbc),
+    0xE5: Instruction("SBC", InstMode.ZeroPage, 3, 0, _sbc),
+    0xF5: Instruction("SBC", InstMode.ZeroPageX, 4, 0, _sbc),
+    0xED: Instruction("SBC", InstMode.Absolute, 4, 0, _sbc),
+    0xFD: Instruction("SBC", InstMode.AbsoluteX, 4, 1, _sbc),
+    0xF9: Instruction("SBC", InstMode.AbsoluteY, 4, 1, _sbc),
+    0xE1: Instruction("SBC", InstMode.IndirectX, 6, 0, _sbc),
+    0xF1: Instruction("SBC", InstMode.IndirectY, 5, 1, _sbc),
+
+    # CMP / CPX / CPY
+    0xC9: Instruction("CMP", InstMode.Immediate, 2, 0, _cmp),
+    0xC5: Instruction("CMP", InstMode.ZeroPage, 3, 0, _cmp),
+    0xD5: Instruction("CMP", InstMode.ZeroPageX, 4, 0, _cmp),
+    0xCD: Instruction("CMP", InstMode.Absolute, 4, 0, _cmp),
+    0xDD: Instruction("CMP", InstMode.AbsoluteX, 4, 1, _cmp),
+    0xD9: Instruction("CMP", InstMode.AbsoluteY, 4, 1, _cmp),
+    0xC1: Instruction("CMP", InstMode.IndirectX, 6, 0, _cmp),
+    0xD1: Instruction("CMP", InstMode.IndirectY, 5, 1, _cmp),
+    0xE0: Instruction("CPX", InstMode.Immediate, 2, 0, _cpx),
+    0xE4: Instruction("CPX", InstMode.ZeroPage, 3, 0, _cpx),
+    0xEC: Instruction("CPX", InstMode.Absolute, 4, 0, _cpx),
+    0xC0: Instruction("CPY", InstMode.Immediate, 2, 0, _cpy),
+    0xC4: Instruction("CPY", InstMode.ZeroPage, 3, 0, _cpy),
+    0xCC: Instruction("CPY", InstMode.Absolute, 4, 0, _cpy),
+
+    # INC / DEC
+    0xE6: Instruction("INC", InstMode.ZeroPage, 5, 0, _inc),
+    0xF6: Instruction("INC", InstMode.ZeroPageX, 6, 0, _inc),
+    0xEE: Instruction("INC", InstMode.Absolute, 6, 0, _inc),
+    0xFE: Instruction("INC", InstMode.AbsoluteX, 7, 0, _inc),
+    0xC6: Instruction("DEC", InstMode.ZeroPage, 5, 0, _dec),
+    0xD6: Instruction("DEC", InstMode.ZeroPageX, 6, 0, _dec),
+    0xCE: Instruction("DEC", InstMode.Absolute, 6, 0, _dec),
+    0xDE: Instruction("DEC", InstMode.AbsoluteX, 7, 0, _dec),
+    0xE8: Instruction("INX", InstMode.Implied, 2, 0, _inx),
+    0xC8: Instruction("INY", InstMode.Implied, 2, 0, _iny),
+    0xCA: Instruction("DEX", InstMode.Implied, 2, 0, _dex),
+    0x88: Instruction("DEY", InstMode.Implied, 2, 0, _dey),
+
+    # ASL
+    0x0A: Instruction("ASL", InstMode.Accumulator, 2, 0, _asl),
+    0x06: Instruction("ASL", InstMode.ZeroPage, 5, 0, _asl),
+    0x16: Instruction("ASL", InstMode.ZeroPageX, 6, 0, _asl),
+    0x0E: Instruction("ASL", InstMode.Absolute, 6, 0, _asl),
+    0x1E: Instruction("ASL", InstMode.AbsoluteX, 7, 0, _asl),
+
+    # LSR
+    0x4A: Instruction("LSR", InstMode.Accumulator, 2, 0, _lsr),
+    0x46: Instruction("LSR", InstMode.ZeroPage, 5, 0, _lsr),
+    0x56: Instruction("LSR", InstMode.ZeroPageX, 6, 0, _lsr),
+    0x4E: Instruction("LSR", InstMode.Absolute, 6, 0, _lsr),
+    0x5E: Instruction("LSR", InstMode.AbsoluteX, 7, 0, _lsr),
+
+    # ROL
+    0x2A: Instruction("ROL", InstMode.Accumulator, 2, 0, _rol),
+    0x26: Instruction("ROL", InstMode.ZeroPage, 5, 0, _rol),
+    0x36: Instruction("ROL", InstMode.ZeroPageX, 6, 0, _rol),
+    0x2E: Instruction("ROL", InstMode.Absolute, 6, 0, _rol),
+    0x3E: Instruction("ROL", InstMode.AbsoluteX, 7, 0, _rol),
+
+    # ROR
+    0x6A: Instruction("ROR", InstMode.Accumulator, 2, 0, _ror),
+    0x66: Instruction("ROR", InstMode.ZeroPage, 5, 0, _ror),
+    0x76: Instruction("ROR", InstMode.ZeroPageX, 6, 0, _ror),
+    0x6E: Instruction("ROR", InstMode.Absolute, 6, 0, _ror),
+    0x7E: Instruction("ROR", InstMode.AbsoluteX, 7, 0, _ror),
+
+    # JMP / JSR / RTS / RTI / BRK
+    0x4C: Instruction("JMP", InstMode.Absolute, 3, 0, _jmp),
+    0x6C: Instruction("JMP", InstMode.Indirect, 5, 0, _jmp),
+    0x20: Instruction("JSR", InstMode.Absolute, 6, 0, _jsr),
+    0x60: Instruction("RTS", InstMode.Implied, 6, 0, _rts),
+    0x40: Instruction("RTI", InstMode.Implied, 6, 0, _rti),
+    0x00: Instruction("BRK", InstMode.Implied, 7, 0, _brk),
+
+    # branches
+    0x90: Instruction("BCC", InstMode.Relative, 2, 0, _bcc),
+    0xB0: Instruction("BCS", InstMode.Relative, 2, 0, _bcs),
+    0xF0: Instruction("BEQ", InstMode.Relative, 2, 0, _beq),
+    0xD0: Instruction("BNE", InstMode.Relative, 2, 0, _bne),
+    0x30: Instruction("BMI", InstMode.Relative, 2, 0, _bmi),
+    0x10: Instruction("BPL", InstMode.Relative, 2, 0, _bpl),
+    0x50: Instruction("BVC", InstMode.Relative, 2, 0, _bvc),
+    0x70: Instruction("BVS", InstMode.Relative, 2, 0, _bvs),
+
+    # flag control
+    0x18: Instruction("CLC", InstMode.Implied, 2, 0, _clc),
+    0x38: Instruction("SEC", InstMode.Implied, 2, 0, _sec),
+    0x58: Instruction("CLI", InstMode.Implied, 2, 0, _cli),
+    0x78: Instruction("SEI", InstMode.Implied, 2, 0, _sei),
+    0xD8: Instruction("CLD", InstMode.Implied, 2, 0, _cld),
+    0xF8: Instruction("SED", InstMode.Implied, 2, 0, _sed),
+    0xB8: Instruction("CLV", InstMode.Implied, 2, 0, _clv),
+
+    # system
+    0xEA: Instruction("NOP", InstMode.Implied, 2, 0, _nop),
+    0x02: Instruction("HLT", InstMode.Implied, 2, 0, _hlt),
 }
 
 
-# Decode `opcode` and run it against `vm`.
+# Decode `opcode` and run it against `vm`, charging its cycle cost.
 # Returns false when the opcode is not implemented.
 def execute(vm: Ptr[VM], opcode: byte) -> bool:
     instruction = INST_MAP.get(opcode)
     if instruction is None:
         return False
 
-    instruction.handler(vm, instruction.mode)
+    operand = resolve(vm, instruction.mode)
+    (*vm).add_cycles(instruction.cycles)
+    if instruction.page_penalty != 0 and operand.page_crossed:
+        (*vm).add_cycles(1)
+
+    instruction.handler(vm, operand.address, operand.value as i64)
     return True
 
 
-# Human-readable text for an opcode, e.g. "LDA immediate".
+# Human-readable text for an opcode, e.g. "LDA absolute,X".
 def mnemonic(opcode: byte) -> str:
     instruction = INST_MAP.get(opcode)
     if instruction is None:

@@ -1,38 +1,144 @@
 import log
 
 import processor
-from vm import VM
+from vm import PROGRAM_START, VM
 
 const MEMORY_SIZE: i64 = 65536
+const HEX_DIGITS: str = "0123456789ABCDEF"
 
 static vm: VM = VM(MEMORY_SIZE)
 static logger: log.Logger = log.get_logger("main")
 
 
-# Fetch, decode, and run a single instruction.
-# The machine is passed as &vm so the handler mutates this VM instead of a copy.
-# Returns false when the opcode is not implemented.
+def hex_byte(value: i64) -> str:
+    return HEX_DIGITS[(value >> 4) & 0x0F] + HEX_DIGITS[value & 0x0F]
+
+
+# Fetch, decode, and run a single instruction. The machine goes in as &vm so
+# handlers mutate this VM instead of a copy of it.
 def step() -> bool:
     opcode = vm.read_byte()
+    logger.error(f"op={hex_byte(opcode)} {processor.mnemonic(opcode)}")
     if not processor.execute(&vm, opcode):
-        logger.error(f"Unknown opcode: {opcode}")
+        logger.error(f"Unknown opcode: {hex_byte(opcode)}")
         return False
 
-    logger.info(f"Executed instruction: {processor.mnemonic(opcode)}")
+    logger.debug(f"Executed instruction: {processor.mnemonic(opcode)}")
     return True
 
 
-def main() -> i32:
-    print(vm.A)
-
-    vm.load([0xA9, 0x04, 0x02])
-    vm.run()
-    for i in range(100):
-        if not vm.is_running():
-            break
+# Run until HLT, or until an unknown opcode shows up.
+def execute_program() -> bool:
+    while vm.is_running():
         if not step():
-            break
-    logger.info("Execution stopped.")
+            return False
+    return True
 
-    print(vm.A)
+
+# Hand-assembled demo.
+#
+#   $1000  LDX #$00
+#   $1002  LDA #$00
+#   $1004  loop: INX
+#   $1005        STX $0200        ; remember the counter
+#   $1008        TXA
+#   $1009        CLC
+#   $100A        ADC $0200        ; A += X
+#   $100D        CPX #$0A
+#   $100F        BNE loop
+#   $1011        STA $0201        ; $0201 = $37  (1 + 2 + ... + 10)
+#   $1014        LDA #$01         ; zero page pointer $10/$11 -> $0201
+#   $1016        STA $10
+#   $1018        LDA #$02
+#   $101A        STA $11
+#   $101C        LDY #$00
+#   $101E        LDA ($10),Y      ; (indirect),Y reads $0201 back
+#   $1020        STA $0202
+#   $1023        LDX #$00
+#   $1025        LDA $10,X        ; zero page,X
+#   $1027        STA $0203
+#   $102A        LDX #$02
+#   $102C        LDA $1040,X      ; absolute,X reaches the table below
+#   $102F        JSR $1050        ; subroutine shifts A left
+#   $1032        STA $0204
+#   $1035        HLT
+#   $1040  table: $11, $22, $33
+#   $1050  ASL A / RTS
+const PROGRAM = [
+    # $1000  LDX #$00
+    0xA2, 0x00,
+    # $1002  LDA #$00
+    0xA9, 0x00,
+    # $1004  loop: INX
+    0xE8,
+    # $1005  STX $0200
+    0x8E, 0x00, 0x02,
+    # $1008  TXA
+    0x8A,
+    # $1009  CLC
+    0x18,
+    # $100A  ADC $0200
+    0x6D, 0x00, 0x02,
+    # $100D  CPX #$0A
+    0xE0, 0x0A,
+    # $100F  BNE loop
+    0xD0, 0xF3,
+    # $1011  STA $0201
+    0x8D, 0x01, 0x02,
+    # $1014  LDA #$01
+    0xA9, 0x01,
+    # $1016  STA $10
+    0x85, 0x10,
+    # $1018  LDA #$02
+    0xA9, 0x02,
+    # $101A  STA $11
+    0x85, 0x11,
+    # $101C  LDY #$00
+    0xA0, 0x00,
+    # $101E  LDA ($10),Y
+    0xB1, 0x10,
+    # $1020  STA $0202
+    0x8D, 0x02, 0x02,
+    # $1023  LDX #$00
+    0xA2, 0x00,
+    # $1025  LDA $10,X
+    0xB5, 0x10,
+    # $1027  STA $0203
+    0x8D, 0x03, 0x02,
+    # $102A  LDX #$02
+    0xA2, 0x02,
+    # $102C  LDA $1040,X
+    0xBD, 0x40, 0x10,
+    # $102F  JSR $1050
+    0x20, 0x50, 0x10,
+    # $1032  STA $0204
+    0x8D, 0x04, 0x02,
+    # $1035  HLT
+    0x02,
+    # $1036  padding out to the data table
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    # $1040  table: $11, $22, $33
+    0x11, 0x22, 0x33,
+    # $1043  padding out to the subroutine
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    # $1050  subroutine: ASL A / RTS
+    0x0A, 0x60,
+]
+
+
+def main() -> i32:
+    logger.error("trace: reset")
+    vm.reset(PROGRAM_START)
+    logger.error("trace: load")
+    vm.load(PROGRAM)
+    logger.error("trace: run")
+    vm.run()
+    logger.error("trace: loop")
+
+    if not execute_program():
+        return 1
+
+    logger.error("trace: done")
+    print(f"state   A=${hex_byte(vm.A)} X=${hex_byte(vm.X)} Y=${hex_byte(vm.Y)} SP=${hex_byte(vm.SP)} P=${hex_byte(vm.P)} CYC={vm.cycles}")
+    print(f"memory  $0200=${hex_byte(vm.read(0x0200))} $0201=${hex_byte(vm.read(0x0201))} $0202=${hex_byte(vm.read(0x0202))} $0203=${hex_byte(vm.read(0x0203))} $0204=${hex_byte(vm.read(0x0204))}")
     return 0

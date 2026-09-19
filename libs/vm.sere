@@ -1,58 +1,165 @@
 import bytes
 
-# Address the emulated program is loaded at and where execution starts.
+# Loading origin, stack page and hardware vectors of the emulated system.
 const PROGRAM_START: i64 = 0x1000
+const STACK_BASE: i64 = 0x0100
+const VECTOR_NMI: i64 = 0xFFFA
+const VECTOR_RESET: i64 = 0xFFFC
+const VECTOR_IRQ: i64 = 0xFFFE
+
+# Bits of the status register (P).
+const FLAG_C: i64 = 0x01
+const FLAG_Z: i64 = 0x02
+const FLAG_I: i64 = 0x04
+const FLAG_D: i64 = 0x08
+const FLAG_B: i64 = 0x10
+const FLAG_U: i64 = 0x20
+const FLAG_V: i64 = 0x40
+const FLAG_N: i64 = 0x80
 
 
-# A small 6502-style machine: registers plus flat, byte-addressable memory.
+# A 6502 CPU: registers, status register, stack and 64K of flat memory.
 #
 # Class instances are values in Sere, so passing a bare VM to a class or
-# function copies it and writes to that copy are lost. Anything that has to
-# mutate the same machine takes it as a Ptr[VM] (see `&vm` in main.sere).
+# function copies it and any writes are lost. Code that has to mutate the same
+# machine takes it as a Ptr[VM] (see `&vm` in main.sere).
 class VM:
     A: i64
     X: i64
     Y: i64
+    SP: i64
+    P: i64
     pc: i64
+    cycles: i64
 
     @private memory: bytes.Buffer
     @private _is_running: bool
 
     def __init__(self, size: i64) -> None:
+        self.memory = bytes.Buffer(size)
+        self.reset(PROGRAM_START)
+
+    # Power-on reset. The real chip loads PC from the reset vector at $FFFC;
+    # pass `entry` to point straight at a program origin instead.
+    def reset(self, entry: i64 = -1) -> void:
         self.A = 0
         self.X = 0
         self.Y = 0
-        self.pc = PROGRAM_START
-        self.memory = bytes.Buffer(size)
+        self.SP = 0xFD
+        self.P = FLAG_I | FLAG_U
+        self.cycles = 0
         self._is_running = False
 
-    def run(self) -> None:
-        self._is_running = True
+        if entry < 0:
+            self.pc = self.read_word_at(VECTOR_RESET)
+        else:
+            self.pc = entry
 
     def read(self, address: i64) -> byte:
-        return self.memory[address]
+        return self.memory[address & 0xFFFF]
 
     def write(self, address: i64, value: byte) -> void:
-        self.memory.set(address, value)
+        self.memory.set(address & 0xFFFF, value)
+
+    def read_word_at(self, address: i64) -> i64:
+        low = self.read(address) as i64
+        high = self.read(address + 1) as i64
+        return low | (high << 8)
+
+    def write_word_at(self, address: i64, value: i64) -> void:
+        self.write(address, (value & 0xFF) as byte)
+        self.write(address + 1, ((value >> 8) & 0xFF) as byte)
 
     # Read the byte the program counter points at, then advance the counter.
     def read_byte(self) -> byte:
-        value = self.memory[self.pc]
-        self.pc += 1
+        value = self.read(self.pc)
+        self.pc = (self.pc + 1) & 0xFFFF
         return value
 
-    def read_byte_at(self, address: i64) -> byte:
-        return self.memory[address]
-
-    def write_byte_at(self, address: i64, value: byte) -> void:
-        self.memory.set(address, value)
+    # Fetch a 16-bit little-endian operand at the program counter.
+    def read_word(self) -> i64:
+        low = self.read_byte() as i64
+        high = self.read_byte() as i64
+        return low | (high << 8)
 
     def load(self, data: list[byte], address: i64 = PROGRAM_START) -> void:
         for i in range(0, i32(len(data))):
             self.write(address + (i as i64), data[i])
 
-    def halt(self):
+    # --- stack -------------------------------------------------------------
+    def push(self, value: byte) -> void:
+        self.write(STACK_BASE + self.SP, value)
+        self.SP = (self.SP - 1) & 0xFF
+
+    def pop(self) -> byte:
+        self.SP = (self.SP + 1) & 0xFF
+        return self.read(STACK_BASE + self.SP)
+
+    # Push/pop a 16-bit value high byte first, the order the chip uses for
+    # return addresses and interrupt frames.
+    def push_word(self, value: i64) -> void:
+        self.push(((value >> 8) & 0xFF) as byte)
+        self.push((value & 0xFF) as byte)
+
+    def pop_word(self) -> i64:
+        low = self.pop() as i64
+        high = self.pop() as i64
+        return low | (high << 8)
+
+    # --- status register ---------------------------------------------------
+    def get_flag(self, mask: i64) -> bool:
+        return (self.P & mask) != 0
+
+    def set_flag(self, mask: i64, on: bool) -> void:
+        if on:
+            self.P = self.P | mask
+        else:
+            self.P = self.P & (mask ^ 0xFF)
+
+    # The status byte as it appears on the stack (bit 5 always reads high).
+    def status(self) -> byte:
+        return (self.P | FLAG_U) as byte
+
+    def set_status(self, value: byte) -> void:
+        self.P = (value as i64) | FLAG_U
+
+    # --- interrupts --------------------------------------------------------
+    def irq(self) -> void:
+        if self.get_flag(FLAG_I):
+            return
+        self._interrupt(VECTOR_IRQ, False, self.pc)
+
+    def nmi(self) -> void:
+        self._interrupt(VECTOR_NMI, False, self.pc)
+
+    # BRK pushes the address after its signature byte and sets B so software
+    # can tell a BRK from a hardware interrupt.
+    def software_break(self) -> void:
+        self._interrupt(VECTOR_IRQ, True, (self.pc + 1) & 0xFFFF)
+
+    def _interrupt(self, vector: i64, is_break: bool, return_pc: i64) -> void:
+        self.push_word(return_pc)
+
+        pushed = self.P | FLAG_U
+        if is_break:
+            pushed = pushed | FLAG_B
+        self.push(pushed as byte)
+
+        self.set_flag(FLAG_I, True)
+        self.pc = self.read_word_at(vector)
+
+    # --- execution ---------------------------------------------------------
+    def add_cycles(self, count: i64) -> void:
+        self.cycles += count
+
+    def run(self) -> void:
+        self._is_running = True
+
+    def halt(self) -> void:
         self._is_running = False
 
     def is_running(self) -> bool:
         return self._is_running
+
+    def state(self) -> str:
+        return f"A={self.A} X={self.X} Y={self.Y} SP={self.SP} P={self.P} PC={self.pc} CYC={self.cycles}"

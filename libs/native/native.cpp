@@ -142,6 +142,12 @@ static bool screen_dirty = false;
 // debugger shortcuts stay out of the way.
 static bool screen_focus = false;
 
+// Debug display tab: 0 = CPU state, 1 = Memory viewer
+static int32_t debug_tab = 0;
+// Memory viewer parameters
+static int64_t mem_view_start = 0x0000;
+static int64_t mem_view_count = 128;
+
 // --- layout (logical units, the renderer is scaled by UI_SCALE) ------------
 
 static const float UI_SCALE = 2.0f;
@@ -321,6 +327,53 @@ static void update_fps(void) {
     fps_drawn = 0;
     fps_since = now;
   }
+}
+
+// --- Memory viewer panel ---------------------------------------------------
+
+static void draw_memory_viewer(void) {
+  fill_rect(panel_x(), panel_y(), PANEL_W, panel_h(), COLOR_PANEL);
+  fill_rect(panel_x(), panel_y(), PANEL_W, 1.0f, COLOR_BORDER);
+  fill_rect(panel_x(), panel_y() + panel_h() - 1.0f, PANEL_W, 1.0f, COLOR_BORDER);
+  fill_rect(panel_x(), panel_y(), 1.0f, panel_h(), COLOR_BORDER);
+  fill_rect(panel_x() + PANEL_W - 1.0f, panel_y(), 1.0f, panel_h(), COLOR_BORDER);
+
+  draw_text("MEMORY", panel_x() + 6.0f, panel_y() + 6.0f, COLOR_ACCENT);
+  draw_text("VIEWER", panel_x() + 6.0f, panel_y() + 6.0f + LINE_H, COLOR_DIM);
+
+  float row = panel_y() + 32.0f;
+
+  // Display memory dump starting at mem_view_start
+  char label[16];
+  int32_t label_pos = 0;
+  write_str(label, label_pos, "0x");
+  write_hex(label, label_pos, mem_view_start, 4);
+  label[label_pos] = '\0';
+
+  draw_text("START", panel_x() + 6.0f, row, COLOR_DIM);
+  draw_text(label, panel_x() + PANEL_W - 6.0f - (float)(label_pos * 8), row, COLOR_TEXT);
+  row += LINE_H;
+
+  // Show sample memory bytes (placeholder - actual memory would be passed from Sere)
+  draw_text("(memory access", panel_x() + 6.0f, row, COLOR_DIM);
+  row += LINE_H;
+  draw_text("from Sere)", panel_x() + 6.0f, row, COLOR_DIM);
+  row += LINE_H + 2.0f;
+
+  fill_rect(panel_x() + 6.0f, row, PANEL_W - 12.0f, 1.0f, COLOR_BORDER);
+  row += LINE_H;
+
+  char count_text[16];
+  int32_t count_pos = 0;
+  write_dec(count_text, count_pos, mem_view_count);
+  count_text[count_pos] = '\0';
+
+  draw_text("BYTES", panel_x() + 6.0f, row, COLOR_DIM);
+  draw_text(count_text, panel_x() + PANEL_W - 6.0f - (float)(count_pos * 8), row, COLOR_TEXT);
+  row += LINE_H;
+
+  const char* hint = "Press M to toggle CPU mode";
+  draw_text(hint, panel_x() + 6.0f, HINT_Y, COLOR_DIM);
 }
 
 // --- CPU state panel -------------------------------------------------------
@@ -559,6 +612,9 @@ extern "C" int64_t semu_gfx_poll(void) {
         case SDL_SCANCODE_KP_MINUS:
           action = ACTION_SLOWER;
           break;
+        case SDL_SCANCODE_M:
+          debug_tab = (debug_tab + 1) % 2;  // Toggle between CPU (0) and Memory (1)
+          break;
         default:
           break;
       }
@@ -594,7 +650,12 @@ extern "C" void semu_gfx_frame(int64_t a, int64_t x, int64_t y, int64_t sp, int6
   set_color(COLOR_BG);
   sdl_RenderClear(renderer);
 
-  draw_panel(a, x, y, sp, pc, p, cycles, speed, state);
+  // Draw either CPU state or memory viewer based on active tab
+  if (debug_tab == 0) {
+    draw_panel(a, x, y, sp, pc, p, cycles, speed, state);
+  } else {
+    draw_memory_viewer();
+  }
   draw_screen();
 
   sdl_RenderPresent(renderer);
@@ -629,6 +690,24 @@ extern "C" int64_t semu_input_state(void) {
   if (keys[SDL_SCANCODE_RIGHT]) mask |= 0x80;
   if (cpu_input && keys[SDL_SCANCODE_D]) mask |= 0x80;
   return mask;
+}
+
+// --- Memory viewer API -------------------------------------------------
+
+extern "C" void semu_gfx_set_memory_view(int64_t start_addr, int64_t byte_count) {
+  mem_view_start = start_addr & 0xFFFF;
+  mem_view_count = byte_count > 0 ? byte_count : 1;
+  if (mem_view_count > 256) {
+    mem_view_count = 256;
+  }
+}
+
+extern "C" int64_t semu_gfx_get_debug_tab(void) {
+  return debug_tab;
+}
+
+extern "C" void semu_gfx_set_debug_tab(int64_t tab) {
+  debug_tab = tab ? 1 : 0;
 }
 
 // --- Sere runtime registration ---------------------------------------------

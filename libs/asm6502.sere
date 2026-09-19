@@ -252,8 +252,15 @@ class Assembler:
             self.line(lines[i])
             i += 1
 
+    # Report an error with context. Format: line NNN: message
     def fail(self, message: str) -> void:
         self.errors = self.errors + f"line {self.line_no}: {message}" + newline()
+
+    # Report error with additional context about assembly state
+    def fail_context(self, message: str, detail: str) -> void:
+        self.fail(message)
+        if len(detail) > 0:
+            self.errors = self.errors + f"         {detail}" + newline()
 
     # --- diagnostics helpers -----------------------------------------------
 

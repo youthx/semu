@@ -18,6 +18,15 @@ const INPUT_PORT: i64 = 0x4016
 const MEMORY_SIZE: i64 = 65536
 const HEX_DIGITS: str = "0123456789ABCDEF"
 
+const VERSION: str = "0.1.0"
+const SEMU_LOGO: str = """
+      _____ ______  ___  ___  _   __
+     / ___// ____/ |  \\/  / | | / /
+     \\__ \\/ __/    | |\\  /  | |/ /
+    ___/ / /___    | | \\/ \\  |   <
+   /____/_____/    |_|\\/\\_\\ |_|\\_\\
+"""
+
 # Video memory: 128x128 pixels, one RGB332 byte per pixel, at $4000-$7FFF.
 const SCREEN_W: i64 = 128
 const SCREEN_H: i64 = 128
@@ -51,6 +60,41 @@ def hex_word(value: i64) -> str:
 
 def newline() -> str:
     return bytes.to_str(bytes.from_hex("0A"))
+
+
+def print_logo() -> void:
+    print(SEMU_LOGO)
+    print(f"SEMU v{VERSION}  --  6502 Emulator")
+    print("")
+
+
+def print_help() -> void:
+    print_logo()
+    print("USAGE")
+    print("  semu [PROGRAM] [OPTIONS]")
+    print("")
+    print("MODES")
+    print("  (no args)                  Run interactive emulator with demo program")
+    print("  PROGRAM.s                  Assemble and run PROGRAM.s in emulator")
+    print("  PROGRAM.bin                Load and run binary image")
+    print("")
+    print("OPTIONS")
+    print("  --org=ADDR                 Load program at address (default $1000)")
+    print("  --check                    Assemble only, report errors")
+    print("  --compile [PROGRAM]        Compile to hex, print result")
+    print("  --out=FILE                 Write compiled bytes to FILE as hex")
+    print("  --symbols                  List symbol table after assembly")
+    print("  --run=N                    Run headless for N instructions")
+    print("  --peek=ADDR[:COUNT]        Dump memory at ADDR (headless mode)")
+    print("  --dump-cpu                 Show opcode table and coverage")
+    print("")
+    print("EXAMPLES")
+    print("  semu                       Interactive demo")
+    print("  semu game.s                Assemble and run game.s")
+    print("  semu game.s --org=$8000    Run at custom origin")
+    print("  semu game.s --check        Check syntax only")
+    print("  semu game.bin --run=10000  Run binary headless")
+    print("")
 
 
 # --- program selection -----------------------------------------------------
@@ -212,23 +256,35 @@ def load_path(path: str, origin: i64) -> bool:
     if has_suffix(path, ".nes"):
         logger.error(".nes ROMs need the NES bus, mappers and PPU first")
         return False
-    text = fs.read_text(path)
-    if len(text) == 0:
-        logger.error(f"could not read {path}")
-        return False
+
+    # Assembly source files
     if has_suffix(path, ".s") or has_suffix(path, ".asm") or has_suffix(path, ".a65"):
+        text = fs.read_text(path)
+        if len(text) == 0:
+            logger.error(f"could not read {path}")
+            return False
         return load_source(text, origin)
-    image: list[byte] = bytes.zeros(0)
-    if has_suffix(path, ".hex"):
-        image = bytes.from_hex(text)
-    else:
-        image = bytes.from_str(text)
-    logger.info(f"loaded {len(image)} bytes from {path} at ${hex_word(origin)}")
-    program_start = origin
-    program_end = origin + len(image)
-    program_ended = False
-    vm.load(image, origin)
-    return True
+
+    # Binary and hex files
+    if has_suffix(path, ".bin") or has_suffix(path, ".hex"):
+        text = fs.read_text(path)
+        if len(text) == 0:
+            logger.error(f"could not read {path}")
+            return False
+        image: list[byte] = bytes.zeros(0)
+        if has_suffix(path, ".hex"):
+            image = bytes.from_hex(text)
+        else:
+            image = bytes.from_str(text)
+        logger.info(f"loaded {len(image)} bytes from {path} at ${hex_word(origin)}")
+        program_start = origin
+        program_end = origin + len(image)
+        program_ended = False
+        vm.load(image, origin)
+        return True
+
+    logger.error(f"unknown file type: {path}")
+    return False
 
 
 def load_program(argv: list[str]) -> bool:
@@ -379,6 +435,14 @@ def compile_only(argv: list[str], out_path: str) -> i32:
 
 
 def main(argv: list[str]) -> i32:
+    if has_option(argv, "--help") or has_option(argv, "-h"):
+        print_help()
+        return 0
+
+    if has_option(argv, "--version"):
+        print_logo()
+        return 0
+
     if has_option(argv, "--dump-cpu"):
         logger.info(f"table entries: {processor.table_size()}")
         print(processor.dump_table(&vm))
@@ -390,9 +454,13 @@ def main(argv: list[str]) -> i32:
 
     out_path = option_value(argv, "--out=")
     run_count = option_value(argv, "--run=")
+    
+    # Headless execution
     if len(run_count) > 0:
         return run_headless(argv, parse_address(run_count))
-    if has_option(argv, "--check") or len(out_path) > 0:
+    
+    # Compile-only modes (--check, --compile, or --out=FILE)
+    if has_option(argv, "--check") or has_option(argv, "--compile") or len(out_path) > 0:
         return compile_only(argv, out_path)
 
     if gfx_init(SCREEN_W, SCREEN_H, SCREEN_ZOOM) == 0:

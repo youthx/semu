@@ -21,9 +21,21 @@ def gfx_poll() -> i64
 extern "C" "semu_gfx_blit"
 def gfx_blit(index: i64, packed: i64) -> void
 
-# Redraws the window with the current CPU state.
+# Redraws the window with the current CPU state or memory viewer.
 extern "C" "semu_gfx_frame"
 def gfx_frame(a: i64, x: i64, y: i64, sp: i64, pc: i64, p: i64, cycles: i64, speed: i64, state: i64) -> void
+
+# Set memory viewer parameters: start address and byte count to display.
+extern "C" "semu_gfx_set_memory_view"
+def gfx_set_memory_view(start_addr: i64, byte_count: i64) -> void
+
+# Get current debug tab (0=CPU, 1=Memory).
+extern "C" "semu_gfx_get_debug_tab"
+def gfx_get_debug_tab() -> i64
+
+# Set current debug tab (0=CPU, 1=Memory).
+extern "C" "semu_gfx_set_debug_tab"
+def gfx_set_debug_tab(tab: i64) -> void
 
 # Pad state from the host keyboard, one bit per button:
 # 0x01 A, 0x02 B, 0x04 Select, 0x08 Start, 0x10 Up, 0x20 Down, 0x40 Left, 0x80 Right.
@@ -38,6 +50,7 @@ const ACTION_STEP: i64 = 3
 const ACTION_RESET: i64 = 4
 const ACTION_FASTER: i64 = 5
 const ACTION_SLOWER: i64 = 6
+const ACTION_TOGGLE_DEBUG_TAB: i64 = 7
 
 # Values accepted by gfx_frame() in the `state` argument.
 const STATE_READY: i64 = 0

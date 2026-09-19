@@ -286,7 +286,6 @@ def load_path(path: str, origin: i64) -> bool:
     logger.error(f"unknown file type: {path}")
     return False
 
-
 def load_program(argv: list[str]) -> bool:
     program_ended = False
     vm.reset(PROGRAM_START)
@@ -422,9 +421,9 @@ def compile_only(argv: list[str], out_path: str) -> i32:
     if has_option(argv, "--symbols"):
         print(string.replace(program.symbols, ";", newline()))
     if len(out_path) > 0:
-        if not fs.write_text(out_path, asm6502.code_hex(program)):
-            logger.error(f"could not write {out_path}")
-            return 1
+        with fs.open(out_path, "wb") as f:
+            f.write_bytes(program.image)
+        # Write binary image data to file (binary is stored as string of raw bytes)
         logger.info(f"wrote {out_path}")
         return 0
     dump = asm6502.code_hex(program)
@@ -454,11 +453,11 @@ def main(argv: list[str]) -> i32:
 
     out_path = option_value(argv, "--out=")
     run_count = option_value(argv, "--run=")
-    
+
     # Headless execution
     if len(run_count) > 0:
         return run_headless(argv, parse_address(run_count))
-    
+
     # Compile-only modes (--check, --compile, or --out=FILE)
     if has_option(argv, "--check") or has_option(argv, "--compile") or len(out_path) > 0:
         return compile_only(argv, out_path)

@@ -1,0 +1,9 @@
+import fs
+
+def main() -> i32:
+    content = fs.read_text("README.txt")
+    if len(content) == 0:
+        print("Could not read file")
+    else:
+        print("File read OK")
+    return 0

@@ -195,6 +195,7 @@ class Assembler:
     uses_label: bool
     operand_text: str
     operand_value: i64
+    operand_undefined: bool
     line_no: i64
     scope: str
     cond_depth: i64
@@ -220,6 +221,7 @@ class Assembler:
         self.uses_label = False
         self.operand_text = ""
         self.operand_value = 0
+        self.operand_undefined = False
         self.line_no = 0
         self.scope = ""
         self.cond_depth = 0
@@ -369,6 +371,7 @@ class Assembler:
 
     def eval(self, expr: str) -> i64:
         self.uses_label = False
+        self.operand_undefined = False
         text = string.strip(expr)
         if len(text) == 0:
             self.fail("missing operand")
@@ -433,6 +436,7 @@ class Assembler:
         value = self.lookup_label(term)
         if value < 0:
             if self.pass2:
+                self.operand_undefined = True
                 self.fail(f"undefined label '{term}'")
             return 0
         self.uses_label = True
@@ -1034,9 +1038,11 @@ class Assembler:
         value = self.operand_value
         if mode == M_REL:
             offset = value - (self.pc + 1)
-            if self.pass2:
+            if self.pass2 and not self.operand_undefined:
                 if offset < -128 or offset > 127:
-                    self.fail(f"branch out of range ({offset})")
+                    self.fail_context(
+                        "branch target is out of range",
+                        f"source ${self.hex_word(self.pc - 1)} target ${self.hex_word(value)} offset {offset}; use JMP or a nearby trampoline")
             self.emit(offset & 0xFF)
             return
         if self.pass2 and mode == M_ZP and (value < 0 or value > 0xFF):
@@ -1098,6 +1104,11 @@ class Assembler:
     def read_operand(self, expr: str) -> void:
         self.operand_text = string.strip(expr)
         self.operand_value = self.eval(self.operand_text)
+
+    def hex_word(self, value: i64) -> str:
+        digits = "0123456789ABCDEF"
+        number = value & 0xFFFF
+        return digits[(number >> 12) & 0x0F] + digits[(number >> 8) & 0x0F] + digits[(number >> 4) & 0x0F] + digits[number & 0x0F]
 
     # Zero page is only chosen for literal values that fit; labels always use
     # the absolute form so both passes compute identical instruction sizes.

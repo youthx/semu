@@ -53,6 +53,7 @@ static decltype(&SDL_UpdateTexture) sdl_UpdateTexture;
 static decltype(&SDL_DestroyTexture) sdl_DestroyTexture;
 static decltype(&SDL_PollEvent) sdl_PollEvent;
 static decltype(&SDL_ConvertEventToRenderCoordinates) sdl_ConvertEventToRenderCoordinates;
+static decltype(&SDL_GetKeyboardState) sdl_GetKeyboardState;
 
 static bool load_sdl3(void) {
   void* library = LoadLibraryA("SDL3.dll");
@@ -95,6 +96,7 @@ static bool load_sdl3(void) {
   SEMU_LOAD(UpdateTexture)
   SEMU_LOAD(DestroyTexture)
   SEMU_LOAD(PollEvent)
+  SEMU_LOAD(GetKeyboardState)
   SEMU_LOAD(ConvertEventToRenderCoordinates)
 
 #undef SEMU_LOAD
@@ -497,12 +499,12 @@ extern "C" int64_t semu_gfx_poll(void) {
         case SDL_SCANCODE_F5:
           action = ACTION_RESET;
           break;
-        case SDL_SCANCODE_UP:
+        case SDL_SCANCODE_RIGHTBRACKET:
         case SDL_SCANCODE_EQUALS:
         case SDL_SCANCODE_KP_PLUS:
           action = ACTION_FASTER;
           break;
-        case SDL_SCANCODE_DOWN:
+        case SDL_SCANCODE_LEFTBRACKET:
         case SDL_SCANCODE_MINUS:
         case SDL_SCANCODE_KP_MINUS:
           action = ACTION_SLOWER;
@@ -544,6 +546,30 @@ extern "C" void semu_gfx_frame(int64_t a, int64_t x, int64_t y, int64_t sp, int6
   sdl_RenderPresent(renderer);
 }
 
+// The pad state from the host keyboard, in the order the 2A03 shifts it out of
+// $4016: A, B, Select, Start, Up, Down, Left, Right.
+extern "C" int64_t semu_input_state(void) {
+  if (sdl_GetKeyboardState == nullptr) {
+    return 0;
+  }
+  int count = 0;
+  const bool* keys = sdl_GetKeyboardState(&count);
+  if (keys == nullptr) {
+    return 0;
+  }
+
+  int64_t mask = 0;
+  if (keys[SDL_SCANCODE_X]) mask |= 0x01;
+  if (keys[SDL_SCANCODE_Z]) mask |= 0x02;
+  if (keys[SDL_SCANCODE_RSHIFT]) mask |= 0x04;
+  if (keys[SDL_SCANCODE_RETURN]) mask |= 0x08;
+  if (keys[SDL_SCANCODE_UP]) mask |= 0x10;
+  if (keys[SDL_SCANCODE_DOWN]) mask |= 0x20;
+  if (keys[SDL_SCANCODE_LEFT]) mask |= 0x40;
+  if (keys[SDL_SCANCODE_RIGHT]) mask |= 0x80;
+  return mask;
+}
+
 // --- Sere runtime registration ---------------------------------------------
 
 static int64_t arg_i64(Sere_Object* const* args, int32_t nargs, int32_t index, int64_t fallback) {
@@ -567,6 +593,10 @@ static Sere_Object* boxed_poll(Sere_Object* const* args, int32_t nargs) {
   return Sere_Long_FromI64(semu_gfx_poll());
 }
 
+static Sere_Object* boxed_input(Sere_Object* const* args, int32_t nargs) {
+  return Sere_Long_FromI64(semu_input_state());
+}
+
 static Sere_Object* boxed_blit(Sere_Object* const* args, int32_t nargs) {
   semu_gfx_blit(arg_i64(args, nargs, 0, 0), arg_i64(args, nargs, 1, 0));
   return Sere_None_New();
@@ -583,6 +613,7 @@ extern "C" void sere_mod_init(void) {
   Sere_DefineFunction("semu_gfx_init", boxed_init, 3);
   Sere_DefineFunction("semu_gfx_shutdown", boxed_shutdown, 0);
   Sere_DefineFunction("semu_gfx_poll", boxed_poll, 0);
+  Sere_DefineFunction("semu_input_state", boxed_input, 0);
   Sere_DefineFunction("semu_gfx_blit", boxed_blit, 2);
   Sere_DefineFunction("semu_gfx_frame", boxed_frame, 9);
 }

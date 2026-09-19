@@ -1,0 +1,657 @@
+# Two-pass 6502 / Ricoh 2A03 assembler.
+#
+#   import asm6502
+#   program = asm6502.assemble(source, origin)
+#   if len(program.errors) > 0: ...
+#   vm.load(program.image[program.origin:program.origin + program.size], program.origin)
+#
+# Supported syntax:
+#   label:            labels, may share a line with an instruction
+#   NAME = expr       constant
+#   .org expr         set the assembly address
+#   .byte v, ...      raw bytes          (.db, .by)
+#   .word v, ...      16-bit little endian (.dw)
+#   .text "abc"       string bytes        (.ascii)
+#   .res n            reserve n zero bytes (.ds)
+#   .align n          pad to a multiple of n
+#   .equ NAME, expr   constant
+#   ; comment
+#
+# Expressions accept $FF, %1010, 0xFF, 0b1010, 123, 'c' (character), * (current
+# address), labels and + / - chains, with optional <low or >high prefixes.
+#
+# Operand selection follows a deterministic rule so both passes agree:
+# numeric operands <= $FF use zero page when the mnemonic has a zero page form,
+# and anything that references a label uses the absolute form.
+#
+# Opcode encodings cover the full official instruction set plus the undocumented
+# opcodes that NES software uses (LAX, SAX, DCP, ISC, SLO, RLA, SRE, RRA, ANC,
+# ALR, ARR, SBX, the multi byte NOPs and the JAM/KIL opcodes).
+
+import bytes
+import string
+
+const IMAGE_SIZE: i64 = 0x10000
+
+# Newline and tab without relying on string escape sequences.
+def newline() -> str:
+    return bytes.to_str(bytes.from_hex("0A"))
+
+
+def tab() -> str:
+    return bytes.to_str(bytes.from_hex("09"))
+
+# Addressing modes.
+const M_IMP: str = "IMP"
+const M_ACC: str = "ACC"
+const M_IMM: str = "IMM"
+const M_ZP: str = "ZP"
+const M_ZPX: str = "ZPX"
+const M_ZPY: str = "ZPY"
+const M_ABS: str = "ABS"
+const M_ABX: str = "ABX"
+const M_ABY: str = "ABY"
+const M_IND: str = "IND"
+const M_IZX: str = "IZX"
+const M_IZY: str = "IZY"
+const M_REL: str = "REL"
+
+
+# The result of assembling: a window of `size` bytes inside `image` starting at
+# `origin`, plus one diagnostic per line and an empty string when it succeeded.
+struct Program:
+    origin: i64
+    size: i64
+    image: list[byte]
+    errors: str
+
+    def ok(self) -> bool:
+        return len(self.errors) == 0
+
+
+# Mnemonic + ":" + mode -> opcode byte.
+const OPS = {
+    # ADC
+    "ADC:IMM": 0x69, "ADC:ZP": 0x65, "ADC:ZPX": 0x75, "ADC:ABS": 0x6D, "ADC:ABX": 0x7D, "ADC:ABY": 0x79, "ADC:IZX": 0x61, "ADC:IZY": 0x71,
+    # AND
+    "AND:IMM": 0x29, "AND:ZP": 0x25, "AND:ZPX": 0x35, "AND:ABS": 0x2D, "AND:ABX": 0x3D, "AND:ABY": 0x39, "AND:IZX": 0x21, "AND:IZY": 0x31,
+    # ASL
+    "ASL:ACC": 0x0A, "ASL:ZP": 0x06, "ASL:ZPX": 0x16, "ASL:ABS": 0x0E, "ASL:ABX": 0x1E,
+    # BIT
+    "BIT:ZP": 0x24, "BIT:ABS": 0x2C,
+    # branches
+    "BCC:REL": 0x90, "BCS:REL": 0xB0, "BEQ:REL": 0xF0, "BMI:REL": 0x30, "BNE:REL": 0xD0, "BPL:REL": 0x10, "BVC:REL": 0x50, "BVS:REL": 0x70,
+    # BRK
+    "BRK:IMP": 0x00, "BRK:IMM": 0x00,
+    # CMP
+    "CMP:IMM": 0xC9, "CMP:ZP": 0xC5, "CMP:ZPX": 0xD5, "CMP:ABS": 0xCD, "CMP:ABX": 0xDD, "CMP:ABY": 0xD9, "CMP:IZX": 0xC1, "CMP:IZY": 0xD1,
+    # CPX / CPY
+    "CPX:IMM": 0xE0, "CPX:ZP": 0xE4, "CPX:ABS": 0xEC,
+    "CPY:IMM": 0xC0, "CPY:ZP": 0xC4, "CPY:ABS": 0xCC,
+    # DEC / INC
+    "DEC:ZP": 0xC6, "DEC:ZPX": 0xD6, "DEC:ABS": 0xCE, "DEC:ABX": 0xDE,
+    "INC:ZP": 0xE6, "INC:ZPX": 0xF6, "INC:ABS": 0xEE, "INC:ABX": 0xFE,
+    # EOR
+    "EOR:IMM": 0x49, "EOR:ZP": 0x45, "EOR:ZPX": 0x55, "EOR:ABS": 0x4D, "EOR:ABX": 0x5D, "EOR:ABY": 0x59, "EOR:IZX": 0x41, "EOR:IZY": 0x51,
+    # flag control
+    "CLC:IMP": 0x18, "CLD:IMP": 0xD8, "CLI:IMP": 0x58, "CLV:IMP": 0xB8,
+    "SEC:IMP": 0x38, "SED:IMP": 0xF8, "SEI:IMP": 0x78,
+    # JMP / JSR / RTI / RTS
+    "JMP:ABS": 0x4C, "JMP:IND": 0x6C, "JSR:ABS": 0x20, "RTI:IMP": 0x40, "RTS:IMP": 0x60,
+    # LDA / LDX / LDY
+    "LDA:IMM": 0xA9, "LDA:ZP": 0xA5, "LDA:ZPX": 0xB5, "LDA:ABS": 0xAD, "LDA:ABX": 0xBD, "LDA:ABY": 0xB9, "LDA:IZX": 0xA1, "LDA:IZY": 0xB1,
+    "LDX:IMM": 0xA2, "LDX:ZP": 0xA6, "LDX:ZPY": 0xB6, "LDX:ABS": 0xAE, "LDX:ABY": 0xBE,
+    "LDY:IMM": 0xA0, "LDY:ZP": 0xA4, "LDY:ZPX": 0xB4, "LDY:ABS": 0xAC, "LDY:ABX": 0xBC,
+    # LSR / ROL / ROR
+    "LSR:ACC": 0x4A, "LSR:ZP": 0x46, "LSR:ZPX": 0x56, "LSR:ABS": 0x4E, "LSR:ABX": 0x5E,
+    "ROL:ACC": 0x2A, "ROL:ZP": 0x26, "ROL:ZPX": 0x36, "ROL:ABS": 0x2E, "ROL:ABX": 0x3E,
+    "ROR:ACC": 0x6A, "ROR:ZP": 0x66, "ROR:ZPX": 0x76, "ROR:ABS": 0x6E, "ROR:ABX": 0x7E,
+    # NOP (official plus the undocumented multi byte forms)
+    "NOP:IMP": 0xEA, "NOP:IMM": 0x80, "NOP:ZP": 0x04, "NOP:ZPX": 0x14, "NOP:ABS": 0x0C, "NOP:ABX": 0x1C,
+    # ORA
+    "ORA:IMM": 0x09, "ORA:ZP": 0x05, "ORA:ZPX": 0x15, "ORA:ABS": 0x0D, "ORA:ABX": 0x1D, "ORA:ABY": 0x19, "ORA:IZX": 0x01, "ORA:IZY": 0x11,
+    # stack
+    "PHA:IMP": 0x48, "PHP:IMP": 0x08, "PLA:IMP": 0x68, "PLP:IMP": 0x28,
+    # SBC
+    "SBC:IMM": 0xE9, "SBC:ZP": 0xE5, "SBC:ZPX": 0xF5, "SBC:ABS": 0xED, "SBC:ABX": 0xFD, "SBC:ABY": 0xF9, "SBC:IZX": 0xE1, "SBC:IZY": 0xF1,
+    # STA / STX / STY
+    "STA:ZP": 0x85, "STA:ZPX": 0x95, "STA:ABS": 0x8D, "STA:ABX": 0x9D, "STA:ABY": 0x99, "STA:IZX": 0x81, "STA:IZY": 0x91,
+    "STX:ZP": 0x86, "STX:ZPY": 0x96, "STX:ABS": 0x8E,
+    "STY:ZP": 0x84, "STY:ZPX": 0x94, "STY:ABS": 0x8C,
+    # transfers
+    "TAX:IMP": 0xAA, "TAY:IMP": 0xA8, "TSX:IMP": 0xBA, "TXA:IMP": 0x8A, "TXS:IMP": 0x9A, "TYA:IMP": 0x98,
+    # increments and decrements
+    "INX:IMP": 0xE8, "INY:IMP": 0xC8, "DEX:IMP": 0xCA, "DEY:IMP": 0x88,
+
+    # --- undocumented ---
+    # LAX
+    "LAX:ZP": 0xA7, "LAX:ZPY": 0xB7, "LAX:ABS": 0xAF, "LAX:ABY": 0xBF, "LAX:IZX": 0xA3, "LAX:IZY": 0xB3,
+    # SAX
+    "SAX:ZP": 0x87, "SAX:ZPY": 0x97, "SAX:ABS": 0x8F, "SAX:IZX": 0x83,
+    # DCP
+    "DCP:ZP": 0xC7, "DCP:ZPX": 0xD7, "DCP:ABS": 0xCF, "DCP:ABX": 0xDF, "DCP:ABY": 0xDB, "DCP:IZX": 0xC3, "DCP:IZY": 0xD3,
+    # ISC / ISB
+    "ISC:ZP": 0xE7, "ISC:ZPX": 0xF7, "ISC:ABS": 0xEF, "ISC:ABX": 0xFF, "ISC:ABY": 0xFB, "ISC:IZX": 0xE3, "ISC:IZY": 0xF3,
+    # SLO
+    "SLO:ZP": 0x07, "SLO:ZPX": 0x17, "SLO:ABS": 0x0F, "SLO:ABX": 0x1F, "SLO:ABY": 0x1B, "SLO:IZX": 0x03, "SLO:IZY": 0x13,
+    # RLA
+    "RLA:ZP": 0x27, "RLA:ZPX": 0x37, "RLA:ABS": 0x2F, "RLA:ABX": 0x3F, "RLA:ABY": 0x3B, "RLA:IZX": 0x23, "RLA:IZY": 0x33,
+    # SRE
+    "SRE:ZP": 0x47, "SRE:ZPX": 0x57, "SRE:ABS": 0x4F, "SRE:ABX": 0x5F, "SRE:ABY": 0x5B, "SRE:IZX": 0x43, "SRE:IZY": 0x53,
+    # RRA
+    "RRA:ZP": 0x67, "RRA:ZPX": 0x77, "RRA:ABS": 0x6F, "RRA:ABX": 0x7F, "RRA:ABY": 0x7B, "RRA:IZX": 0x63, "RRA:IZY": 0x73,
+    # ANC / ALR / ARR / SBX
+    "ANC:IMM": 0x0B, "ANC2:IMM": 0x2B, "ALR:IMM": 0x4B, "ARR:IMM": 0x6B, "SBX:IMM": 0xCB,
+    # LAS / AHX / SHX / SHY / TAS
+    "LAS:ABY": 0xBB, "AHX:IZY": 0x93, "AHX:ABY": 0x9F, "SHX:ABY": 0x9E, "SHY:ABX": 0x9C, "TAS:ABY": 0x9B,
+    # JAM / KIL
+    "JAM:IMP": 0x02, "HLT:IMP": 0x02,
+}
+
+
+# How many operand bytes a mode uses.
+def operand_size(mode: str) -> i64:
+    if mode == M_IMP:
+        return 0
+    if mode == M_ACC:
+        return 0
+    if mode == M_ABS:
+        return 2
+    if mode == M_ABX:
+        return 2
+    if mode == M_ABY:
+        return 2
+    if mode == M_IND:
+        return 2
+    return 1
+
+
+class Assembler:
+    image: list[byte]
+    origin: i64
+    pc: i64
+    highest: i64
+    labels: str
+    errors: str
+    pass2: bool
+    uses_label: bool
+    operand_text: str
+    operand_value: i64
+    line_no: i64
+
+    def __init__(self, origin: i64) -> void:
+        self.image = bytes.zeros(IMAGE_SIZE)
+        self.origin = origin
+        self.pc = origin
+        self.highest = origin
+        self.labels = ""
+        self.errors = ""
+        self.pass2 = False
+        self.uses_label = False
+        self.operand_text = ""
+        self.operand_value = 0
+        self.line_no = 0
+
+    # --- driving -----------------------------------------------------------
+
+    def run(self, source: str) -> void:
+        self.pass_over(source, False)
+        if len(self.errors) > 0:
+            return
+        self.pass_over(source, True)
+
+    def pass_over(self, source: str, second: bool) -> void:
+        self.pass2 = second
+        self.pc = self.origin
+        self.line_no = 0
+        lines = string.split(source, newline())
+        i = 0
+        while i < i32(len(lines)):
+            self.line(lines[i])
+            i += 1
+
+    def fail(self, message: str) -> void:
+        self.errors = self.errors + f"line {self.line_no}: {message}" + newline()
+
+    # --- diagnostics helpers -----------------------------------------------
+
+    def dec(self, value: i64) -> str:
+        return str(value)
+
+    # Hex digit value, or -1. Avoids string-to-int casts entirely.
+    def hex_value_of(self, glyph: str) -> i64:
+        digits = "0123456789ABCDEF"
+        i = 0
+        while i < 16:
+            if glyph == digits[i]:
+                return i
+            i += 1
+        return -1
+
+    # ASCII code of a character literal such as 'A.
+    def char_code(self, glyph: str) -> i64:
+        upper = string.upper(glyph)
+        digits = "0123456789"
+        i = 0
+        while i < 10:
+            if upper == digits[i]:
+                return 48 + i
+            i += 1
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        i = 0
+        while i < 26:
+            if upper == letters[i]:
+                return 65 + i
+            i += 1
+        if glyph == " ":
+            return 32
+        return 0
+
+    # --- emission ----------------------------------------------------------
+
+    def emit(self, value: i64) -> void:
+        if self.pc >= 0 and self.pc < IMAGE_SIZE:
+            if self.pass2:
+                bytes.set(self.image, self.pc, (value & 0xFF) as byte)
+        self.pc += 1
+        if self.pc > self.highest:
+            self.highest = self.pc
+
+    def emit_word(self, value: i64) -> void:
+        self.emit(value & 0xFF)
+        self.emit((value >> 8) & 0xFF)
+
+    # --- label table -------------------------------------------------------
+    # Labels live in one string of "name=value;" entries, so lookups stay plain
+    # string searches.
+
+    def define_label(self, name: str, value: i64) -> void:
+        if self.pass2:
+            return
+        if self.lookup_label(name) >= 0:
+            self.fail(f"label '{name}' is already defined")
+            return
+        self.labels = self.labels + name + "=" + self.dec(value) + ";"
+
+    def lookup_label(self, name: str) -> i64:
+        if len(name) == 0:
+            return -1
+        needle = name + "="
+        start = 0
+        while start < i32(len(self.labels)):
+            window = self.labels[start:]
+            found = string.find(window, needle)
+            if found < 0:
+                return -1
+            position = start + found
+            if position == 0 or self.labels[position - 1] == ";":
+                return self.parse_dec(self.labels, position + i32(len(needle)))
+            start = position + 1
+        return -1
+
+    def parse_dec(self, text: str, start: i64) -> i64:
+        value = 0
+        i = start
+        while i < len(text) and text[i] >= "0" and text[i] <= "9":
+            value = value * 10 + self.hex_value_of(text[i])
+            i += 1
+        return value
+
+    # --- expressions -------------------------------------------------------
+
+    def eval(self, expr: str) -> i64:
+        self.uses_label = False
+        text = string.strip(expr)
+        if len(text) == 0:
+            self.fail("missing operand")
+            return 0
+        low = False
+        high = False
+        if text[0] == "<":
+            low = True
+            text = string.strip(text[1:])
+        elif text[0] == ">":
+            high = True
+            text = string.strip(text[1:])
+        value = self.eval_sum(text)
+        if low:
+            return value & 0xFF
+        if high:
+            return (value >> 8) & 0xFF
+        return value
+
+    def eval_sum(self, text: str) -> i64:
+        total = 0
+        polarity = 1
+        term = ""
+        i = 0
+        while i < i32(len(text)):
+            glyph = text[i]
+            if glyph == "+":
+                total = total + polarity * self.eval_term(term)
+                polarity = 1
+                term = ""
+            elif glyph == "-":
+                total = total + polarity * self.eval_term(term)
+                polarity = -1
+                term = ""
+            else:
+                term = term + glyph
+            i += 1
+        return total + polarity * self.eval_term(term)
+
+    def eval_term(self, text: str) -> i64:
+        term = string.strip(text)
+        if len(term) == 0:
+            return 0
+        first = term[0]
+        if first == "$":
+            return self.hex_value(term[1:])
+        if first == "%":
+            return self.bin_value(term[1:])
+        if first == "'":
+            if len(term) >= 2:
+                return self.char_code(term[1])
+            self.fail("empty character literal")
+            return 0
+        if first == "*":
+            return self.pc
+        if first >= "0" and first <= "9":
+            if string.starts_with(string.upper(term), "0X"):
+                return self.hex_value(term[2:])
+            if len(term) > 1 and (term[1] == "b" or term[1] == "B"):
+                return self.bin_value(term[2:])
+            return self.dec_value(term)
+        value = self.lookup_label(term)
+        if value < 0:
+            if self.pass2:
+                self.fail(f"undefined label '{term}'")
+            return 0
+        self.uses_label = True
+        return value
+
+    def dec_value(self, text: str) -> i64:
+        value = 0
+        i = 0
+        while i < i32(len(text)) and text[i] >= "0" and text[i] <= "9":
+            value = value * 10 + self.hex_value_of(text[i])
+            i += 1
+        return value
+
+    def hex_value(self, text: str) -> i64:
+        value = 0
+        i = 0
+        while i < i32(len(text)):
+            digit = self.hex_value_of(text[i])
+            if digit < 0:
+                return value
+            value = value * 16 + digit
+            i += 1
+        return value
+
+    def bin_value(self, text: str) -> i64:
+        value = 0
+        i = 0
+        while i < i32(len(text)):
+            glyph = text[i]
+            if glyph == "0":
+                value = value * 2
+            elif glyph == "1":
+                value = value * 2 + 1
+            else:
+                return value
+            i += 1
+        return value
+
+    # --- source ------------------------------------------------------------
+
+    def line(self, raw: str) -> void:
+        self.line_no += 1
+        text = string.replace(raw, tab(), " ")
+        cut = string.find(text, ";")
+        if cut >= 0:
+            text = text[:cut]
+        rest = string.strip(text)
+
+        # Labels and constants may share a line with an instruction.
+        while len(rest) > 0:
+            colon = string.find(rest, ":")
+            equals = string.find(rest, "=")
+            if colon > 0 and (equals < 0 or colon < equals) and self.label_head(rest, colon):
+                name = string.strip(rest[:colon])
+                if len(name) > 0:
+                    self.define_label(name, self.pc)
+                rest = string.strip(rest[colon + 1:])
+                continue
+            if equals > 0 and self.label_head(rest, equals):
+                name = string.strip(rest[:equals])
+                value = self.eval(rest[equals + 1:])
+                if len(name) > 0:
+                    self.define_label(name, value)
+                rest = ""
+                continue
+            break
+
+        if len(rest) == 0:
+            return
+        if rest[0] == ".":
+            self.directive(rest)
+            return
+
+        space = string.find(rest, " ")
+        if space < 0:
+            self.instruction(rest, "")
+            return
+        self.instruction(rest[:space], string.strip(rest[space + 1:]))
+
+    # True when everything before `position` is one bare symbol.
+    def label_head(self, text: str, position: i64) -> bool:
+        head = string.strip(text[:position])
+        if len(head) == 0:
+            return False
+        return string.find(head, " ") < 0
+
+    def quote(self) -> str:
+        return bytes.to_str(bytes.from_hex("22"))
+
+    def directive(self, text: str) -> void:
+        space = string.find(text, " ")
+        name: str = string.upper(text)
+        args: str = ""
+        if space >= 0:
+            name = string.upper(text[:space])
+            args = string.strip(text[space + 1:])
+
+        if name == ".ORG":
+            self.pc = self.eval(args)
+            if self.pc > self.highest:
+                self.highest = self.pc
+            return
+        if name == ".BYTE" or name == ".DB" or name == ".BY":
+            self.emit_list(args, 1)
+            return
+        if name == ".WORD" or name == ".DW":
+            self.emit_list(args, 2)
+            return
+        if name == ".TEXT" or name == ".ASCII" or name == ".ASC":
+            self.emit_text(args)
+            return
+        if name == ".RES" or name == ".DS":
+            count = self.eval(args)
+            i = 0
+            while i < count:
+                self.emit(0)
+                i += 1
+            return
+        if name == ".ALIGN":
+            self.pad_to(self.eval(args))
+            return
+        if name == ".EQU":
+            comma = string.find(args, ",")
+            if comma < 0:
+                self.fail(".equ needs a name and a value")
+                return
+            self.define_label(string.strip(args[:comma]), self.eval(args[comma + 1:]))
+            return
+        self.fail(f"unknown directive '{name}'")
+
+    # Pad to a multiple of `align` using subtraction only.
+    def pad_to(self, align: i64) -> void:
+        if align <= 1:
+            return
+        probe = self.pc
+        while probe >= align:
+            probe = probe - align
+        if probe == 0:
+            return
+        pad = align - probe
+        i = 0
+        while i < pad:
+            self.emit(0)
+            i += 1
+
+    def emit_list(self, args: str, width: i64) -> void:
+        parts = string.split(args, ",")
+        i = 0
+        while i < i32(len(parts)):
+            value = self.eval(parts[i])
+            if width == 1:
+                self.emit(value)
+            else:
+                self.emit_word(value)
+            i += 1
+
+    def emit_text(self, args: str) -> void:
+        text = string.strip(args)
+        mark = self.quote()
+        start = string.find(text, mark)
+        if start < 0:
+            self.fail("unterminated string")
+            return
+        end = string.find(text[start + 1:], mark)
+        if end < 0:
+            self.fail("unterminated string")
+            return
+        body = text[start + 1:start + 1 + end]
+        i = 0
+        while i < i32(len(body)):
+            self.emit(self.char_code(body[i]))
+            i += 1
+
+    # --- instructions ------------------------------------------------------
+
+    def instruction(self, mnemonic: str, operand: str) -> void:
+        name = string.upper(string.strip(mnemonic))
+        if len(name) == 0:
+            return
+        mode = self.classify(name, operand)
+        opcode = OPS.get(name + ":" + mode)
+        if opcode is None:
+            self.fail(f"'{name}' has no {mode} addressing mode")
+            return
+        self.emit(opcode)
+        self.emit_operand(mode)
+
+    def emit_operand(self, mode: str) -> void:
+        if operand_size(mode) == 0:
+            return
+        value = self.operand_value
+        if mode == M_REL:
+            offset = value - (self.pc + 1)
+            if self.pass2:
+                if offset < -128 or offset > 127:
+                    self.fail(f"branch out of range ({offset})")
+            self.emit(offset & 0xFF)
+            return
+        if self.pass2 and mode == M_ZP and (value < 0 or value > 0xFF):
+            self.fail(f"zero page address out of range ({value})")
+        if operand_size(mode) == 1:
+            self.emit(value & 0xFF)
+            return
+        self.emit_word(value)
+
+    def classify(self, name: str, text: str) -> str:
+        self.operand_text = ""
+        self.operand_value = 0
+        raw = string.strip(text)
+        if len(raw) == 0:
+            if OPS.get(name + ":" + M_IMP) is not None:
+                return M_IMP
+            return M_ACC
+        if raw[0] == "#":
+            self.read_operand(raw[1:])
+            return M_IMM
+        if string.upper(raw) == "A":
+            if OPS.get(name + ":" + M_ACC) is not None:
+                return M_ACC
+        if raw[0] == "(":
+            close = string.find(raw, ")")
+            if close > 0:
+                inner = string.strip(raw[1:close])
+                tail = string.upper(string.strip(raw[close + 1:]))
+                if tail == ",Y":
+                    self.read_operand(inner)
+                    return M_IZY
+                if len(tail) == 0:
+                    if len(inner) >= 2 and string.upper(inner[len(inner) - 2:]) == ",X":
+                        self.read_operand(inner[:len(inner) - 2])
+                        return M_IZX
+                    self.read_operand(inner)
+                    return M_IND
+        if len(raw) >= 2:
+            tail2 = string.upper(raw[len(raw) - 2:])
+            if tail2 == ",X":
+                self.read_operand(raw[:len(raw) - 2])
+                if self.zero_page_ok(name, M_ZPX):
+                    return M_ZPX
+                return M_ABX
+            if tail2 == ",Y":
+                self.read_operand(raw[:len(raw) - 2])
+                if self.zero_page_ok(name, M_ZPY):
+                    return M_ZPY
+                return M_ABY
+        self.read_operand(raw)
+        if self.zero_page_ok(name, M_ZP):
+            return M_ZP
+        if OPS.get(name + ":" + M_ABS) is not None:
+            return M_ABS
+        if OPS.get(name + ":" + M_REL) is not None:
+            return M_REL
+        return M_ABS
+
+    def read_operand(self, expr: str) -> void:
+        self.operand_text = string.strip(expr)
+        self.operand_value = self.eval(self.operand_text)
+
+    # Zero page is only chosen for literal values that fit; labels always use
+    # the absolute form so both passes compute identical instruction sizes.
+    def zero_page_ok(self, name: str, mode: str) -> bool:
+        if self.uses_label:
+            return False
+        if self.operand_value < 0 or self.operand_value > 0xFF:
+            return False
+        return OPS.get(name + ":" + mode) is not None
+
+
+def assemble(source: str, origin: i64) -> Program:
+    tool = Assembler(origin)
+    tool.run(source)
+    size = tool.highest - origin
+    if size < 0:
+        size = 0
+    return Program(origin, size, tool.image, tool.errors)
+
+
+# The assembled bytes on their own, ready for VM.load.
+def code_window(program: Program) -> list[byte]:
+    out = bytes.zeros(program.size)
+    i = 0
+    while i < program.size:
+        bytes.set(out, i, bytes.get(program.image, program.origin + i))
+        i += 1
+    return out
+
+
+# Hex dump of the assembled window, e.g. "A9 00 85 10".
+def code_hex(program: Program) -> str:
+    return bytes.hex(code_window(program))
